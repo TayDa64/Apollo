@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 @dataclass
@@ -22,14 +22,16 @@ class CriticFeatures:
 
 
 def _iter_note_events(
-    midi_source: Union[str, Path],
+    midi_source: Union[str, Path, Any],
 ) -> Tuple[int, List[Tuple[int, int, int, int, int, str]]]:
     """Return ``(ticks_per_beat, notes)`` where notes are
     ``(start_tick, duration_ticks, pitch, velocity, channel, track_name)``.
+
+    Accepts a filesystem path OR an already-loaded ``mido.MidiFile``.
     """
     import mido
 
-    midi = mido.MidiFile(str(midi_source))
+    midi = midi_source if isinstance(midi_source, mido.MidiFile) else mido.MidiFile(str(midi_source))
     ticks_per_beat = int(getattr(midi, "ticks_per_beat", 480) or 480)
 
     notes: List[Tuple[int, int, int, int, int, str]] = []
@@ -69,14 +71,14 @@ def _iter_note_events(
 
 
 def extract_note_events_from_midi(
-    midi_path: Union[str, Path],
+    midi_path: Union[str, Path, Any],
 ) -> Tuple[int, List[Tuple[int, int, int, int, int, str]]]:
-    """Public helper returning ``(ticks_per_beat, note_events)`` from a MIDI file."""
+    """Public helper returning ``(ticks_per_beat, note_events)`` from a MIDI file or ``mido.MidiFile``."""
     return _iter_note_events(midi_path)
 
 
 def extract_note_tuples_from_midi(
-    midi_path: Union[str, Path],
+    midi_path: Union[str, Path, Any],
 ) -> Tuple[int, List[Tuple[int, int, int, int]], List[Tuple[int, int, int, int]]]:
     """Return ``(ticks_per_beat, melodic_notes, drum_notes)`` as 4-tuples for ``QualityValidator``."""
     ticks_per_beat, events = _iter_note_events(midi_path)
@@ -92,7 +94,7 @@ def extract_note_tuples_from_midi(
 
 
 def extract_critic_features_from_midi(
-    midi_path: Union[str, Path],
+    midi_path: Union[str, Path, Any],
     *,
     time_signature: Tuple[int, int] = (4, 4),
     tension_curve: Optional[List[float]] = None,

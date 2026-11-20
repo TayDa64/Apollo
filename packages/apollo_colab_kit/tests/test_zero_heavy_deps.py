@@ -1,4 +1,4 @@
-"""Hard isolation test: importing muse_colab_kit must pull ZERO heavy/MUSE deps."""
+"""Hard isolation test: importing apollo_colab_kit must pull ZERO heavy/MUSE deps."""
 
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ FORBIDDEN_MODULES = (
 def test_fresh_interpreter_imports_zero_heavy_or_muse_modules():
     code = (
         "import sys\n"
-        "import muse_colab_kit\n"
-        "import muse_colab_kit.schemas\n"
-        "import muse_colab_kit.verifiers\n"
-        "import muse_colab_kit.dataset_export\n"
+        "import apollo_colab_kit\n"
+        "import apollo_colab_kit.schemas\n"
+        "import apollo_colab_kit.verifiers\n"
+        "import apollo_colab_kit.prompt_sweep\n"
+        "import apollo_colab_kit.dataset_export\n"
         f"forbidden = {FORBIDDEN_MODULES!r}\n"
         "loaded = [m for m in forbidden if any(k == m or k.startswith(m + '.') for k in sys.modules)]\n"
         "assert not loaded, f'Forbidden heavy/MUSE modules loaded: {loaded}'\n"

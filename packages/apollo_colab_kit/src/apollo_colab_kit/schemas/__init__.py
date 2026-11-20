@@ -78,8 +78,8 @@ BundledSchemaName = Literal[
 
 
 def load_bundled_schema(name: BundledSchemaName) -> Dict[str, Any]:
-    """Load one of the frozen JSON Schema files bundled in ``muse_colab_kit.schemas.data``."""
-    data_file = resources.files("muse_colab_kit.schemas").joinpath("data", name)
+    """Load one of the frozen JSON Schema files bundled in ``apollo_colab_kit.schemas.data``."""
+    data_file = resources.files("apollo_colab_kit.schemas").joinpath("data", name)
     return json.loads(data_file.read_text(encoding="utf-8"))
 
 

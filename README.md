@@ -1,10 +1,43 @@
-# 🎵 Multimodal AI Music Generator
+# 🎵 Apollo — Neural-First Multimodal AI Music Generator
 
-> **Transform natural language into production-ready music projects with MIDI, audio, and MPC export**
+> **Standalone successor forked from [MUSE (`multimodal-ai-music-gen`)](https://github.com/TayDa64/multimodal-ai-music-gen): combining a verified deterministic MIDI/audio/MPC synthesis engine with a strict `neural_io_v1` Gemma 4 runtime boundary and pure-Python Colab SFT + GRPO training kit.**
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![MPC Compatible](https://img.shields.io/badge/MPC-2.13.1.27+-red.svg)](https://www.akaipro.com/)
+
+> **Architecture Lineage Note (v1):** Apollo keeps MUSE's battle-tested internal Python engine path (`multimodal_gen/`) and JUCE desktop symbols (`juce/Source/`) unchanged in v1 to preserve zero-regression stability across all 1,778+ automated tests while branding the repository boundary, neural contracts, and Colab training kit under **Apollo** (`packages/apollo_colab_kit/`, CLI `apollo-colab-export`).
+
+---
+
+## 🚀 Apollo Standalone Setup & GitHub Remote
+
+When promoting this workspace to a fresh GitHub repository (recommended after moving the folder out of OneDrive to a local path such as `C:\dev\apollo` so cloud sync does not lock `.git/`, `.venv/`, or dataset shards):
+
+```bash
+# 1. Verify no MUSE remote is attached
+git remote -v
+
+# 2. Attach your new standalone Apollo repository and push
+git remote add origin https://github.com/TayDa64/apollo.git
+git branch -M main
+git push -u origin main
+```
+
+### Pure-Python Colab Training Kit (`apollo-colab-kit`)
+
+Apollo separates its Colab SFT + GRPO training contracts and deterministic verifiers into a standalone zero-heavy-dependency package at `packages/apollo_colab_kit/` (`pydantic`, `mido`, `PyYAML` only — zero JUCE, FluidSynth, `pygame`, `librosa`, `numba`, `llvmlite`, `scipy`, `numpy`, or `torch`):
+
+```bash
+# Install editable inside Apollo's local .venv
+uv pip install --python .\.venv\Scripts\python.exe -e packages/apollo_colab_kit --no-deps
+
+# Export held-out golden eval benchmark (zero leakage)
+apollo-colab-export --prompts tests/fixtures/golden_prompts.json --eval-golden --output-dir output/apollo_colab_bundle
+
+# Generate deduplicated synthetic train/val shards filtered by deterministic verifiers
+apollo-colab-export --sweep --train-target 3500 --val-target 300 --exclude-prompts tests/fixtures/golden_prompts.json --output-dir output/apollo_colab_bundle
+```
 
 ---
 

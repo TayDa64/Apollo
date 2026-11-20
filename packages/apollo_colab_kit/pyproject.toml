@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "muse-colab-kit"
+name = "apollo-colab-kit"
 version = "0.1.0"
-description = "Standalone pure-Python schemas, deterministic GRPO verifiers, and local dataset exporter for MUSE"
+description = "Standalone pure-Python schemas, deterministic GRPO verifiers, prompt sweep generator, and local dataset exporter for Apollo (forked from MUSE)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,7 +19,7 @@ dev = ["pytest>=7.4.0"]
 jsonschema = ["jsonschema>=4.20.0"]
 
 [project.scripts]
-muse-colab-export = "muse_colab_kit.dataset_export:main"
+apollo-colab-export = "apollo_colab_kit.dataset_export:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -28,4 +28,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"muse_colab_kit.schemas" = ["data/*.json"]
+"apollo_colab_kit.schemas" = ["data/*.json"]

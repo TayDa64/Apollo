@@ -229,7 +229,7 @@ def instrument_range_reward(
 
 def critics_reward(
     *,
-    midi_path: Optional[Union[str, Path]] = None,
+    midi_path: Optional[Union[str, Path, Any]] = None,
     voicings: Optional[Sequence[Sequence[int]]] = None,
     bass_notes: Optional[Sequence[Dict[str, int]]] = None,
     kick_ticks: Optional[Sequence[int]] = None,
@@ -336,7 +336,7 @@ def composite_grpo_reward(
     completion: Union[str, Mapping[str, Any], ScorePlanV1],
     *,
     notes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
-    midi_path: Optional[Union[str, Path]] = None,
+    midi_path: Optional[Union[str, Path, Any]] = None,
     genre: Optional[str] = None,
     key: Optional[str] = None,
     scale: Optional[str] = None,

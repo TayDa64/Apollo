@@ -8,12 +8,12 @@ import struct
 import wave
 from pathlib import Path
 
-from muse_colab_kit.dataset_export import (
+from apollo_colab_kit.dataset_export import (
     load_prompt_specs,
     resample_wav_to_16k_mono,
     write_sharded_jsonl,
 )
-from muse_colab_kit.schemas import (
+from apollo_colab_kit.schemas import (
     DatasetRecordV1,
     MidiArtifactV1,
     MidiNoteEventV1,

@@ -1,4 +1,4 @@
-"""Standalone schema validation tests for muse_colab_kit.schemas."""
+"""Standalone schema validation tests for apollo_colab_kit.schemas."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from muse_colab_kit.schemas import (
+from apollo_colab_kit.schemas import (
     ArrangementTemplateV1,
     AudioConditioningRef,
     DatasetRecordV1,

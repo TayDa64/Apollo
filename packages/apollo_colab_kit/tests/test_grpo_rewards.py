@@ -1,4 +1,4 @@
-"""Deterministic GRPO reward tests for muse_colab_kit.verifiers.rewards."""
+"""Deterministic GRPO reward tests for apollo_colab_kit.verifiers.rewards."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import mido
 
-from muse_colab_kit.verifiers import (
+from apollo_colab_kit.verifiers import (
     RewardBreakdown,
     composite_grpo_reward,
     critics_reward,

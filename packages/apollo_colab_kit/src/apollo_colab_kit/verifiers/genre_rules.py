@@ -18,7 +18,7 @@ Per likuTasks.md Milestone B:
 - If rules are missing for a genre, generation behaves as today.
 
 Usage:
-    from muse_colab_kit.verifiers.genre_rules import (
+    from apollo_colab_kit.verifiers.genre_rules import (
         GenreRulesEngine,
         get_genre_rules,
         validate_generation,

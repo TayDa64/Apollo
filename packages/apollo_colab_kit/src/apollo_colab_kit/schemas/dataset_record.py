@@ -11,7 +11,7 @@ from .neural_io import AudioConditioningRef
 from .score_plan import ScorePlanV1
 
 
-DATASET_SCHEMA_VERSION = "muse_dataset_v1"
+DATASET_SCHEMA_VERSION = "apollo_dataset_v1"
 
 _STRICT_CONFIG = ConfigDict(extra="forbid", frozen=True)
 
@@ -54,9 +54,9 @@ class DatasetRecordV1(BaseModel):
 
     model_config = _STRICT_CONFIG
 
-    schema_version: Literal["muse_dataset_v1"] = DATASET_SCHEMA_VERSION
+    schema_version: Literal["apollo_dataset_v1"] = DATASET_SCHEMA_VERSION
     record_id: str = Field(..., min_length=1)
-    split: Literal["train", "eval"] = "train"
+    split: Literal["train", "val", "eval"] = "train"
     seed: int
     prompt: str = Field(..., min_length=1)
     genre: str = Field(..., min_length=1)

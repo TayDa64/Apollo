@@ -6,7 +6,7 @@ from pathlib import Path
 
 import mido
 
-from muse_colab_kit.verifiers import (
+from apollo_colab_kit.verifiers import (
     GenreRulesEngine,
     QualityValidator,
     clamp_to_range,

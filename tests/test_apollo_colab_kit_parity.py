@@ -1,4 +1,4 @@
-"""Cross-repo parity tests verifying muse_colab_kit matches MUSE bit-for-bit."""
+"""Cross-repo parity tests verifying apollo_colab_kit matches MUSE bit-for-bit."""
 
 from __future__ import annotations
 
@@ -10,21 +10,24 @@ import mido
 import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
-COLAB_KIT_SRC = PROJECT_ROOT / "packages" / "muse_colab_kit" / "src"
+COLAB_KIT_SRC = PROJECT_ROOT / "packages" / "apollo_colab_kit" / "src"
 if str(COLAB_KIT_SRC) not in sys.path:
     sys.path.insert(0, str(COLAB_KIT_SRC))
 
-from muse_colab_kit.dataset_export import (
+from apollo_colab_kit.dataset_export import (
     DatasetExportConfig,
     export_dataset,
+    export_eval_golden,
+    export_sweep_dataset,
     load_prompt_specs,
 )
-from muse_colab_kit.schemas import (
+from apollo_colab_kit.prompt_sweep import normalize_prompt_text
+from apollo_colab_kit.schemas import (
     DatasetRecordV1,
     load_arrangement_template_yaml,
     load_bundled_schema,
 )
-from muse_colab_kit.verifiers import (
+from apollo_colab_kit.verifiers import (
     GenreRulesEngine as KitGenreRulesEngine,
     INSTRUMENT_RANGES as KIT_INSTRUMENT_RANGES,
     QualityValidator as KitQualityValidator,
@@ -166,3 +169,52 @@ def test_local_dataset_export_end_to_end_smoke(tmp_path: Path):
             assert 0.0 <= rec.verifier_scores.total_reward <= 1.0
             assert rec.midi.relative_path is not None
             assert (out_dir / rec.midi.relative_path).is_file()
+
+
+def test_eval_golden_and_prompt_sweep_zero_leakage_smoke(tmp_path: Path):
+    golden_path = PROJECT_ROOT / "tests" / "fixtures" / "golden_prompts.json"
+    out_dir = tmp_path / "apollo_bundle"
+    cfg = DatasetExportConfig(
+        output_dir=out_dir,
+        base_seed=2026,
+        min_reward=0.60,
+        min_genre_reward=0.80,
+        max_events_inline=0,
+        write_midi_files=False,
+        include_audio_16k=False,
+    )
+
+    golden_manifest = export_eval_golden(golden_path, config=cfg)
+    assert golden_manifest["eval_golden"]["records"] == 22
+    assert (out_dir / "eval_golden.jsonl").is_file()
+
+    sweep_manifest = export_sweep_dataset(
+        train_target=10,
+        val_target=4,
+        config=cfg,
+        exclude_prompts_path=golden_path,
+    )
+    assert sweep_manifest["train"]["records"] == 10
+    assert sweep_manifest["val"]["records"] == 4
+    assert sweep_manifest["zero_leakage_verified"] is True
+
+    golden_norms = {
+        normalize_prompt_text(DatasetRecordV1.model_validate_json(line).prompt)
+        for line in (out_dir / "eval_golden.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    train_norms = {
+        normalize_prompt_text(DatasetRecordV1.model_validate_json(line).prompt)
+        for line in (out_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    val_norms = {
+        normalize_prompt_text(DatasetRecordV1.model_validate_json(line).prompt)
+        for line in (out_dir / "val.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+    assert train_norms.isdisjoint(golden_norms)
+    assert val_norms.isdisjoint(golden_norms)
+    assert train_norms.isdisjoint(val_norms)
+
