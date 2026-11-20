@@ -1084,6 +1084,19 @@ class Arranger:
         # Ambient has lower drum density
         if _genre_norm == 'ambient':
             config.drum_density = max(0.0, config.drum_density - 0.2)
+
+        # Compact Eskista arrangements (<= 16 bars) leave intro/outro unchorded
+        # so Krar/Begena accompaniment enters in middle sections only.
+        try:
+            _compact_target_bars = int(self._min_bars_override or 0)
+        except (TypeError, ValueError):
+            _compact_target_bars = 0
+        if (
+            _genre_norm == 'eskista'
+            and 0 < _compact_target_bars <= 16
+            and section_type in (SectionType.INTRO, SectionType.OUTRO)
+        ):
+            config.enable_chords = False
         
         # Apply mood modifications
         if parsed.mood == 'dark':

@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 import dataclasses
 from enum import Enum
 
@@ -110,7 +110,7 @@ class MusicGenOSCServer:
         # Expansion Manager
         # ExpansionManager is an optional dependency in some environments; keep annotation permissive
         self._expansion_manager: Optional[Any] = None
-        if EXPANSION_AVAILABLE:
+        if EXPANSION_AVAILABLE and create_expansion_manager is not None:
             # Use factory function to auto-discover expansions in standard locations
             # This finds ../expansions automatically
             self._expansion_manager = create_expansion_manager(auto_scan=True)
@@ -127,11 +127,12 @@ class MusicGenOSCServer:
         self._comp_regions: Dict[str, Any] = {}
         self._pending_generation_request: Optional[GenerationRequest] = None
         self._last_render_context: Optional[Dict[str, Any]] = None
+        self._owned_task_ids: Set[str] = set()
         
         # Callbacks for external integration (optional)
-        self.on_generation_start: Optional[callable] = None
-        self.on_generation_complete: Optional[callable] = None
-        self.on_error: Optional[callable] = None
+        self.on_generation_start: Optional[Callable[..., Any]] = None
+        self.on_generation_complete: Optional[Callable[..., Any]] = None
+        self.on_error: Optional[Callable[..., Any]] = None
         
         # Setup message handlers
         self._setup_handlers()
@@ -194,6 +195,7 @@ class MusicGenOSCServer:
                 pass
         
         self._running = True
+        assert self._server is not None
         
         try:
             self._server.serve_forever()
@@ -214,6 +216,7 @@ class MusicGenOSCServer:
             Thread object running the server
         """
         self._initialize()
+        assert self._server is not None
         
         self._running = True
         self._server_thread = threading.Thread(
@@ -284,6 +287,44 @@ class MusicGenOSCServer:
     # =========================================================================
     # OSC Message Handlers
     # =========================================================================
+
+    def _validate_schema_version(self, raw_version: Any, request_id: str = "") -> bool:
+        """Validate client schema_version against server SCHEMA_VERSION.
+
+        - Client == Server: proceed normally.
+        - Client < Server: emit non-blocking schema_version_warning status and proceed.
+        - Client > Server: reject with ErrorCode.SCHEMA_VERSION_MISMATCH (103).
+        """
+        try:
+            schema_version = int(raw_version)
+        except (TypeError, ValueError):
+            schema_version = SCHEMA_VERSION
+
+        if schema_version == SCHEMA_VERSION:
+            return True
+
+        self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+        if schema_version > SCHEMA_VERSION:
+            self._send_error(
+                ErrorCode.SCHEMA_VERSION_MISMATCH,
+                f"Client schema version {schema_version} is newer than server version {SCHEMA_VERSION}. Please update the server.",
+                request_id=request_id,
+            )
+            return False
+
+        self._send_status(
+            "schema_version_warning",
+            {
+                "client_version": schema_version,
+                "server_version": SCHEMA_VERSION,
+                "message": (
+                    f"Client uses schema v{schema_version}, server uses v{SCHEMA_VERSION}. "
+                    "Proceeding with best-effort compatibility."
+                ),
+            },
+            request_id=request_id,
+        )
+        return True
     
     def _handle_generate(self, address: str, *args):
         """
@@ -339,26 +380,9 @@ class MusicGenOSCServer:
                 self._log("   ⚠️  Missing request_id in generate request. Generating temporary ID.")
                 request_id = str(uuid.uuid4())
             
-            schema_version = data.get("schema_version", 1)
-            
-            # Schema version handling: reject major mismatches, warn on minor
-            if schema_version != SCHEMA_VERSION:
-                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
-                # For major version differences (e.g., client=2, server=1), reject
-                if schema_version > SCHEMA_VERSION:
-                    self._send_error(
-                        ErrorCode.SCHEMA_VERSION_MISMATCH,
-                        f"Client schema version {schema_version} is newer than server version {SCHEMA_VERSION}. Please update the server.",
-                        request_id=request_id
-                    )
-                    return
-                # For older clients, we can try best-effort but send a warning status
-                self._send_status("schema_version_warning", {
-                    "request_id": request_id,
-                    "client_version": schema_version,
-                    "server_version": SCHEMA_VERSION,
-                    "message": f"Client uses schema v{schema_version}, server uses v{SCHEMA_VERSION}. Proceeding with best-effort compatibility."
-                })
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            if not self._validate_schema_version(schema_version, request_id=request_id):
+                return
             
             # Validate prompt
             prompt = data.get("prompt", "").strip()
@@ -452,8 +476,9 @@ class MusicGenOSCServer:
                 genre=data.get("genre", ""),  # Genre ID from JUCE GenreSelector
                 bpm=int(data.get("bpm", 0)),
                 key=data.get("key", ""),
+                mode=data.get("mode", ""),
                 duration_bars=duration_bars,
-                output_dir=data.get("output_dir", self.config.default_output_dir),
+                output_dir=data.get("output_dir", self.config.default_output_dir or ""),
                 instruments=data.get("instruments", self.config.instrument_paths),
                 soundfont=data.get("soundfont", self.config.default_soundfont or ""),
                 render_audio=data.get("render_audio", self.config.auto_render_audio),
@@ -477,14 +502,24 @@ class MusicGenOSCServer:
             # Optional callback
             if self.on_generation_start:
                 self.on_generation_start(request)
+
+            if self._gen_worker is None:
+                self._send_error(
+                    ErrorCode.WORKER_CRASHED,
+                    "Generation worker is not initialized",
+                    request_id=request_id,
+                )
+                return
             
             # Submit to worker
             task_id = self._gen_worker.submit(request)
+            with self._lock:
+                self._owned_task_ids.add(task_id)
             self._pending_generation_request = request
             self._log(f"   Task ID: {task_id}")
             
             # Send acknowledgment with request_id
-            self._send_status("generation_started", {"task_id": task_id, "request_id": request_id})
+            self._send_status("generation_started", {"task_id": task_id}, request_id=request_id)
             
         except json.JSONDecodeError as e:
             self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
@@ -539,13 +574,12 @@ class MusicGenOSCServer:
             data = json.loads(args[0]) if isinstance(args[0], str) else {}
 
             request_id = data.get("request_id", "")
-            schema_version = int(data.get("schema_version", 1))
-
-            if schema_version != SCHEMA_VERSION:
-                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            if not self._validate_schema_version(schema_version, request_id=request_id):
+                return
 
             source_url = (data.get("url") or "").strip()
-            source_path = (data.get("path") or "").strip()
+            source_path = (data.get("path") or data.get("file_path") or "").strip()
             verbose = bool(data.get("verbose", self.config.verbose))
 
             if not source_url and not source_path:
@@ -650,7 +684,7 @@ class MusicGenOSCServer:
                     return
 
             def _to_jsonable(obj: Any) -> Any:
-                if dataclasses.is_dataclass(obj):
+                if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
                     return {k: _to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
                 if isinstance(obj, Enum):
                     return obj.value
@@ -717,15 +751,8 @@ class MusicGenOSCServer:
             data = json.loads(args[0]) if isinstance(args[0], str) else {}
             
             request_id = data.get("request_id", str(uuid.uuid4()))
-            schema_version = int(data.get("schema_version", 1))
-            
-            # Validate schema version
-            if schema_version > SCHEMA_VERSION:
-                self._send_error(
-                    ErrorCode.SCHEMA_VERSION_MISMATCH,
-                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
-                    request_id=request_id
-                )
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            if not self._validate_schema_version(schema_version, request_id=request_id):
                 return
             
             start_bar = int(data.get("start_bar", 0))
@@ -774,13 +801,20 @@ class MusicGenOSCServer:
             
             # Build request with regeneration metadata
             from .worker import GenerationRequest
+
+            parsed_mode = (
+                parsed.scale_type.name.lower()
+                if getattr(parsed, "scale_type", None) is not None
+                else ""
+            )
             
             regen_request = GenerationRequest(
                 request_id=request_id,
+                schema_version=schema_version,
                 prompt=prompt_override or parsed.raw_prompt,
-                bpm=parsed.bpm or base_bpm,
+                bpm=int(round(parsed.bpm or base_bpm)),
                 key=parsed.key or base_key,
-                mode=parsed.mode or base_mode,
+                mode=parsed_mode or str(base_mode),
                 duration_bars=end_bar - start_bar,
                 genre=parsed.genre or options.get("genre", ""),
                 options={
@@ -792,17 +826,26 @@ class MusicGenOSCServer:
                     "seed_strategy": seed_strategy,
                 }
             )
+
+            if self._gen_worker is None:
+                self._send_error(
+                    ErrorCode.WORKER_CRASHED,
+                    "Generation worker is not initialized",
+                    request_id=request_id,
+                )
+                return
             
             # Send status update
             self._send_status("regeneration_started", {
-                "request_id": request_id,
                 "start_bar": start_bar,
                 "end_bar": end_bar,
                 "tracks": tracks
             }, request_id=request_id)
             
             # Submit to worker
-            self._gen_worker.submit(regen_request)
+            task_id = self._gen_worker.submit(regen_request)
+            with self._lock:
+                self._owned_task_ids.add(task_id)
             self._pending_generation_request = regen_request
             
         except json.JSONDecodeError as e:
@@ -836,11 +879,11 @@ class MusicGenOSCServer:
                 return
             
             data = json.loads(args[0]) if isinstance(args[0], str) else {}
-            schema_version = int(data.get("schema_version", 1))
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
             fx_chain = data.get("fx_chain", {})
             
-            if schema_version > SCHEMA_VERSION:
-                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+            if not self._validate_schema_version(schema_version):
+                return
             
             # Store FX chain configuration for use during generation
             self._current_fx_chain = fx_chain
@@ -897,13 +940,8 @@ class MusicGenOSCServer:
             data = json.loads(args[0]) if isinstance(args[0], str) else {}
 
             request_id = data.get("request_id", str(uuid.uuid4()))
-            schema_version = int(data.get("schema_version", 1))
-            if schema_version > SCHEMA_VERSION:
-                self._send_error(
-                    ErrorCode.SCHEMA_VERSION_MISMATCH,
-                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
-                    request_id=request_id,
-                )
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            if not self._validate_schema_version(schema_version, request_id=request_id):
                 return
 
             raw_overrides = data.get("overrides", {})
@@ -917,6 +955,7 @@ class MusicGenOSCServer:
                 "preset",
                 "style_preset",
                 "production_preset",
+                "orchestral_stage_preset",
                 "duration_bars",
                 "seed",
                 "num_takes",
@@ -962,13 +1001,8 @@ class MusicGenOSCServer:
             data = json.loads(args[0]) if isinstance(args[0], str) else {}
 
             request_id = data.get("request_id", str(uuid.uuid4()))
-            schema_version = int(data.get("schema_version", 1))
-            if schema_version > SCHEMA_VERSION:
-                self._send_error(
-                    ErrorCode.SCHEMA_VERSION_MISMATCH,
-                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
-                    request_id=request_id,
-                )
+            schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+            if not self._validate_schema_version(schema_version, request_id=request_id):
                 return
 
             keys = data.get("keys")
@@ -1009,7 +1043,8 @@ class MusicGenOSCServer:
         try:
             data = json.loads(args[0]) if args else {}
             paths = data.get("paths", [])
-            cache_dir = data.get("cache_dir", str(Path(self.config.default_output_dir)))
+            default_cache_dir = str(Path(self.config.default_output_dir or "output"))
+            cache_dir = str(data.get("cache_dir") or default_cache_dir)
             
             # If no paths provided, use default configured paths
             if not paths:
@@ -1019,6 +1054,13 @@ class MusicGenOSCServer:
                 self._send_error(
                     ErrorCode.MISSING_PARAMETER,
                     "No instrument paths provided and no defaults configured"
+                )
+                return
+            
+            if self._instrument_worker is None:
+                self._send_error(
+                    ErrorCode.WORKER_CRASHED,
+                    "Instrument scan worker is not initialized",
                 )
                 return
             
@@ -1095,6 +1137,7 @@ class MusicGenOSCServer:
             categories = self._expansion_manager.get_categories()
             
             response = {
+                "schema_version": SCHEMA_VERSION,
                 "expansions": expansions,
                 "categories": categories,
             }
@@ -1324,6 +1367,7 @@ class MusicGenOSCServer:
             self._selected_takes[track] = take_id
             
             self._send_message(OSCAddresses.TAKE_SELECTED, json.dumps({
+                "schema_version": SCHEMA_VERSION,
                 "request_id": request_id,
                 "track": track,
                 "take_id": take_id,
@@ -1656,8 +1700,8 @@ class MusicGenOSCServer:
 
         return AudioRenderer(
             soundfont_path=soundfont_path,
-            expansion_manager=self._expansion_manager,
-            genre=genre,
+            expansion_manager=self._expansion_manager,  # type: ignore[arg-type]
+            genre=str(genre) if genre else "trap_soul",
             ai_metadata={
                 "source_task_id": cached_result.task_id,
                 "source_request_id": cached_result.request_id,
@@ -1857,6 +1901,7 @@ class MusicGenOSCServer:
                 return
 
             self._send_message(OSCAddresses.TAKE_RENDERED, json.dumps({
+                "schema_version": SCHEMA_VERSION,
                 "request_id": request_id,
                 "track": resolved_track or track,
                 "take_id": take_id if take_id else ("comp" if track and use_comp else ""),
@@ -1878,6 +1923,7 @@ class MusicGenOSCServer:
     def _on_progress(self, step: str, percent: float, message: str):
         """Called by worker to report progress."""
         self._send_message(OSCAddresses.PROGRESS, json.dumps({
+            "schema_version": SCHEMA_VERSION,
             "request_id": self._current_request_id or "",
             "step": step,
             "percent": percent,
@@ -1958,6 +2004,7 @@ class MusicGenOSCServer:
         req_id = request_id or self._current_request_id or ""
         
         self._send_message(OSCAddresses.ERROR, json.dumps({
+            "schema_version": SCHEMA_VERSION,
             "request_id": req_id,
             "code": code,
             "message": message,
@@ -1967,12 +2014,16 @@ class MusicGenOSCServer:
             ),
         }))
     
-    def _send_status(self, status: str, data: Dict[str, Any]):
+    def _send_status(self, status: str, data: Dict[str, Any], request_id: str = ""):
         """Send a status update to the client."""
-        self._send_message(OSCAddresses.STATUS, json.dumps({
+        payload: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
             "status": status,
             **data,
-        }))
+        }
+        if request_id and "request_id" not in payload:
+            payload["request_id"] = request_id
+        self._send_message(OSCAddresses.STATUS, json.dumps(payload))
 
     # =========================================================================
     # Intelligence Push Notifications (Sprint 4)

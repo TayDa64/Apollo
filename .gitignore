@@ -1,5 +1,5 @@
 # =============================================================================
-# Multimodal AI Music Generator - Git Ignore
+# Multimodal AI Music Generator (MUSE) - Git Ignore
 # =============================================================================
 
 # Python
@@ -23,6 +23,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 venv/
@@ -46,9 +49,24 @@ desktop.ini
 # Project-specific ignores
 # =============================================================================
 
-# Output directory - ignore all generated music EXCEPT the showcase example
-output/*
-!output/boom_bap_100bpm_Csharpminor_20251209_133208_mpc/
+# Native build output
+juce/build/
+
+# Package build artifacts
+packages/*/build/
+packages/*/dist/
+packages/*/*.egg-info/
+packages/*/src/*.egg-info/
+
+# Mutable agent/orchestration runtime state
+.github/state/*.json
+
+# Generated output artifacts (all runtime renders, diagnostics, logs)
+output/
+output_cli_golden*/
+output_cli_golden_full/
+output_cli_golden_short/
+test_output_integration/
 
 # Instrument analysis cache (regenerated on first run)
 instruments/.instrument_cache.json
@@ -91,6 +109,9 @@ instruments/fx/*.WAV
 
 # Development test scripts (local only)
 audio_test.py
+check_acceptance_criteria.py
+verify_chord_extraction.py
+.coverage
 
 # SoundFont files (too large for repo)
 *.sf2
@@ -100,7 +121,7 @@ audio_test.py
 *.sfz
 *.SFZ
 
-# Audio files in root (test outputs)
+# Audio files (test outputs)
 *.wav
 *.mp3
 *.aif
@@ -110,16 +131,6 @@ audio_test.py
 # Exception: self-owned shippable hybrid attack-layer assets
 !assets/attack_samples/**/*.wav
 
-# But allow audio in the showcase example
-!output/boom_bap_100bpm_Csharpminor_20251209_133208_mpc/**/*.wav
-!output/boom_bap_100bpm_Csharpminor_20251209_133208_mpc/**/*.WAV
-
-test_output_integration/
-# Temporary verification scripts (not for commit)
-check_acceptance_criteria.py
-verify_chord_extraction.py
-.coverage
-
-output_cli_golden*/
-output_cli_golden_full/
-output_cli_golden_short/
+# Exception: never ignore checked-in test fixtures (JSON, MIDI, or audio)
+!tests/fixtures/
+!tests/fixtures/**

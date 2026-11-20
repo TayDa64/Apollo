@@ -24,7 +24,6 @@ Or standalone:
 from __future__ import annotations
 
 import json
-import time
 import logging
 import signal
 import sys
@@ -33,7 +32,7 @@ import time
 import uuid
 import dataclasses
 from enum import Enum
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import (
@@ -220,7 +219,7 @@ class MusicGenJSONRPCServer:
         self.verbose = self.config.verbose
 
         # HTTP server (created in start / start_async)
-        self._httpd: Optional[HTTPServer] = None
+        self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
 
         # Worker
@@ -573,11 +572,13 @@ class MusicGenJSONRPCServer:
         return {"task_id": task_id, "cancelled": cancelled}
 
     def _handle_run_critics(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Run quality-gate critics on a MIDI file.
+        """Run quality-gate critics on pre-extracted arrays or a MIDI file.
 
         Params:
-            midi_path: Path to the MIDI file to evaluate.
-            genre: Genre identifier for context-aware evaluation.
+            midi_path: Optional path to a MIDI file to evaluate when pre-extracted
+                       arrays are not supplied.
+            voicings / bass_notes / kick_ticks / tension_curve / note_density_per_beat:
+                       Optional pre-extracted critic inputs.
 
         Returns:
             CriticReport as a dict with metrics and overall verdict.
@@ -586,17 +587,24 @@ class MusicGenJSONRPCServer:
         from ..intelligence.critics import run_all_critics, CriticReport  # noqa: F811
 
         midi_path = params.get("midi_path")
-        if not midi_path:
-            raise TypeError("Missing required param: midi_path")
-
-        # run_all_critics accepts analysis data, not raw file paths.
-        # The caller should supply pre-extracted data when available.
         voicings = params.get("voicings")
         bass_notes = params.get("bass_notes")
         kick_ticks = params.get("kick_ticks")
-        tolerance_ticks = params.get("tolerance_ticks", 60)
+        tolerance_ticks = int(params.get("tolerance_ticks", 60))
         tension_curve = params.get("tension_curve")
         note_density_per_beat = params.get("note_density_per_beat")
+
+        has_inline_inputs = any(
+            v is not None
+            for v in (voicings, bass_notes, kick_ticks, tension_curve, note_density_per_beat)
+        )
+        if not midi_path and not has_inline_inputs:
+            raise TypeError("Missing required param: midi_path (or inline critic feature arrays)")
+
+        if midi_path and not has_inline_inputs:
+            from pathlib import Path as _Path
+            if _Path(str(midi_path)).is_file():
+                return self._handle_run_critics_midi(params)
 
         report: CriticReport = run_all_critics(
             voicings=voicings,
@@ -649,7 +657,7 @@ class MusicGenJSONRPCServer:
         def _json_safe(value: Any) -> Any:
             if isinstance(value, Enum):
                 return value.value
-            if dataclasses.is_dataclass(value):
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
                 return {k: _json_safe(v) for k, v in dataclasses.asdict(value).items()}
             if isinstance(value, dict):
                 return {k: _json_safe(v) for k, v in value.items()}
@@ -762,7 +770,8 @@ class MusicGenJSONRPCServer:
         duration_bars = max(1, min(duration_bars, 64))
 
         genre_hint = params.get("genre")
-        base_options = params.get("options") if isinstance(params.get("options"), dict) else {}
+        raw_base_options = params.get("options")
+        base_options: Dict[str, Any] = dict(raw_base_options) if isinstance(raw_base_options, dict) else {}
 
         from ..intelligence.auto_producer import auto_score_plan_v1
 
@@ -849,8 +858,9 @@ class MusicGenJSONRPCServer:
                         "timestamp": time.time(),
                     })
                     try:
+                        analysis_genre = str(score_plan.get("genre") or genre_hint or "ambient")
                         audio_analysis = self._handle_analyze_output(
-                            {"audio_path": gen["audio_path"], "genre": genre_hint or "ambient"}
+                            {"audio_path": gen["audio_path"], "genre": analysis_genre}
                         )
                     except Exception:
                         audio_analysis = None
@@ -1280,33 +1290,45 @@ class MusicGenJSONRPCServer:
         if score_plan is not None and not isinstance(score_plan, dict):
             score_plan = None
 
+        raw_options = params.get("options", {})
+        options: Dict[str, Any] = dict(raw_options) if isinstance(raw_options, dict) else {}
+
+        duration_bars = int(params.get("duration_bars", params.get("bars", options.get("duration_bars", options.get("bars", 8)))))
+
         return GenerationRequest(
             prompt=prompt,
             request_id=params.get("request_id", str(uuid.uuid4())[:8]),
-            schema_version=SCHEMA_VERSION,
+            schema_version=int(params.get("schema_version", SCHEMA_VERSION)),
             genre=params.get("genre", ""),
             bpm=int(params.get("bpm", 0)),
             key=params.get("key", ""),
             mode=params.get("mode", ""),
-            duration_bars=int(params.get("duration_bars", 8)),
+            duration_bars=duration_bars,
             output_dir=params.get("output_dir", self.config.default_output_dir or ""),
-            instruments=params.get("instruments", []),
-            soundfont=params.get("soundfont", ""),
+            instruments=params.get("instruments", list(self.config.instrument_paths)),
+            soundfont=params.get("soundfont", self.config.default_soundfont or ""),
             render_audio=params.get("render_audio", self.config.auto_render_audio),
             export_stems=params.get("export_stems", self.config.auto_export_stems),
             export_mpc=params.get("export_mpc", self.config.auto_export_mpc),
+            reference_url=params.get("reference_url", ""),
+            reference_bpm=int(params.get("reference_bpm", 0) or 0),
+            reference_key=params.get("reference_key", ""),
+            reference_genre=params.get("reference_genre", ""),
+            template=params.get("template", ""),
+            verbose=bool(params.get("verbose", self.config.verbose)),
             num_takes=int(params.get("num_takes", 1)),
             take_variation=params.get("take_variation", ""),
-            options=params.get("options", {}),
+            options=options,
             score_plan=score_plan,
         )
 
     def _create_httpd(self) -> None:
-        """Create and configure the underlying HTTPServer."""
-        self._httpd = HTTPServer(
+        """Create and configure the underlying ThreadingHTTPServer."""
+        self._httpd = ThreadingHTTPServer(
             (self.host, self.port),
             _JSONRPCRequestHandler,
         )
+        self._httpd.daemon_threads = True
         # Attach a back-reference so the handler can reach the dispatcher
         self._httpd.rpc_server = self  # type: ignore[attr-defined]
         self._httpd.verbose = self.verbose  # type: ignore[attr-defined]

@@ -33,10 +33,15 @@ struct GenerationRequest
     int bars = 8;                   // Number of bars to generate
     int numTakes = 1;               // Number of takes per track (1 = disabled)
     juce::String key;               // Empty = auto-detect
+    juce::String mode;              // Optional scale mode (e.g., "minor", "major", "dorian")
     juce::String outputDir;
     juce::StringArray instrumentPaths;
     juce::String soundfontPath;
     juce::String referenceUrl;
+    int referenceBpm = 0;           // Optional reference BPM hint (> 0 to emit)
+    juce::String referenceKey;      // Optional reference key hint
+    juce::String referenceGenre;    // Optional reference genre hint
+    juce::String scorePlanJson;     // Optional serialized score_plan_v1 JSON object
     juce::var options;             // Optional Phase 5.2 per-request overrides
     bool renderAudio = true;
     bool exportStems = false;
@@ -63,9 +68,23 @@ struct GenerationRequest
         obj->setProperty("bars", bars);
         obj->setProperty("num_takes", numTakes);
         obj->setProperty("key", key);
+        if (mode.isNotEmpty())
+            obj->setProperty("mode", mode);
         obj->setProperty("output_dir", outputDir);
         obj->setProperty("soundfont", soundfontPath);
         obj->setProperty("reference_url", referenceUrl);
+        if (referenceBpm > 0)
+            obj->setProperty("reference_bpm", referenceBpm);
+        if (referenceKey.isNotEmpty())
+            obj->setProperty("reference_key", referenceKey);
+        if (referenceGenre.isNotEmpty())
+            obj->setProperty("reference_genre", referenceGenre);
+        if (scorePlanJson.isNotEmpty())
+        {
+            auto parsedPlan = juce::JSON::parse(scorePlanJson);
+            if (parsedPlan.isObject())
+                obj->setProperty("score_plan", parsedPlan);
+        }
         if (options.isObject() || options.isArray())
             obj->setProperty("options", options);
         obj->setProperty("render_audio", renderAudio);
@@ -223,6 +242,12 @@ struct GenerationResult
         {
             for (int i = 0; i < stems.size(); ++i)
                 result.stemPaths.add(stems[i].toString());
+        }
+        else if (stems.isString())
+        {
+            auto stemsStr = stems.toString();
+            if (stemsStr.isNotEmpty())
+                result.stemPaths.add(stemsStr);
         }
         
         // Metadata

@@ -153,6 +153,7 @@ class GenerationResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for OSC transmission."""
         return {
+            "schema_version": SCHEMA_VERSION,
             "task_id": self.task_id,
             "request_id": self.request_id,
             "success": self.success,
@@ -861,7 +862,7 @@ class InstrumentScanWorker:
             
             library = load_multiple_libraries(
                 paths,
-                cache_dir=cache_dir,
+                cache_dir=cache_dir or "",
                 auto_load_audio=False,
                 verbose=True,
                 progress_callback=_progress,

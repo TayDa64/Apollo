@@ -154,15 +154,12 @@ class TestStemSeparation:
         assert sep is not None
 
 
-# --- mc-008: Spatial Audio (archived to _deprecated/) ---
-class TestSpatialAudio:
-    def test_import(self):
-        from multimodal_gen._deprecated.spatial_audio import HRTFProcessor
-
-    def test_instantiate(self):
-        from multimodal_gen._deprecated.spatial_audio import HRTFProcessor
-        spatial = HRTFProcessor()
-        assert spatial is not None
+# --- mc-008: Spatial Audio (removed with _deprecated/) ---
+class TestSpatialAudioRetired:
+    def test_deprecated_spatial_audio_removed(self):
+        import importlib.util
+        assert importlib.util.find_spec("multimodal_gen._deprecated") is None
+        assert importlib.util.find_spec("multimodal_gen.spatial_audio") is None
 
 
 # --- Cross-module wiring tests ---

@@ -157,3 +157,61 @@ def test_run_proof_uses_shared_resolver_without_path_prepend_and_records_json_co
     assert generation_payload["success"] is True
     assert generation_payload["results"]["render_report"].endswith("proof_render_report.json")
     assert json.loads((paths.run_dir / "generation_stdout.txt").read_text(encoding="utf-8"))["success"] is True
+
+
+def test_run_proof_missing_soundfont_does_not_create_output_directory(monkeypatch, tmp_path):
+    script = _load_script_module()
+    runtime_module = script._load_fluidsynth_runtime()
+
+    monkeypatch.setattr(runtime_module, "resolve_fluidsynth_executable", lambda: None)
+    monkeypatch.setattr(runtime_module, "probe_fluidsynth", lambda exe=None, *, timeout=3: (None, False, None))
+    monkeypatch.setattr(script, "_find_soundfont", lambda repo_root, explicit: None)
+
+    output_root = tmp_path / "never_created"
+    args = argparse.Namespace(
+        soundfont=None,
+        output_root=str(output_root),
+        prompt="rock proof",
+        duration_bars=4,
+        seed=1,
+    )
+
+    try:
+        script.run_proof(args)
+        raise AssertionError("Expected FileNotFoundError when soundfont is missing")
+    except FileNotFoundError as exc:
+        assert "No SoundFont found" in str(exc)
+
+    assert not output_root.exists()
+
+
+def test_check_environment_reports_missing_and_ready_states(monkeypatch, tmp_path):
+    script = _load_script_module()
+    runtime_module = script._load_fluidsynth_runtime()
+
+    # Missing both FluidSynth and SoundFont
+    monkeypatch.setattr(runtime_module, "resolve_fluidsynth_executable", lambda: None)
+    monkeypatch.setattr(runtime_module, "probe_fluidsynth", lambda exe=None, *, timeout=3: (None, False, None))
+    monkeypatch.setattr(script, "_find_soundfont", lambda repo_root, explicit: None)
+
+    missing_report = script.check_environment()
+    assert missing_report["ready"] is False
+    assert missing_report["missing"] == ["fluidsynth_executable", "soundfont"]
+    assert missing_report["soundfont"] is None
+
+    # Ready state
+    sf = tmp_path / "gm.sf2"
+    sf.write_bytes(b"sf2")
+    monkeypatch.setattr(runtime_module, "resolve_fluidsynth_executable", lambda: "/bin/fluidsynth")
+    monkeypatch.setattr(
+        runtime_module,
+        "probe_fluidsynth",
+        lambda exe=None, *, timeout=3: (exe, True, "FluidSynth 2.4.7"),
+    )
+    monkeypatch.setattr(script, "_find_soundfont", lambda repo_root, explicit: sf)
+
+    ready_report = script.check_environment(str(sf))
+    assert ready_report["ready"] is True
+    assert ready_report["missing"] == []
+    assert ready_report["soundfont"] == str(sf)
+    assert ready_report["fluidsynth_probe"]["available"] is True

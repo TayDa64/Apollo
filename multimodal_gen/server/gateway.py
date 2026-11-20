@@ -2,9 +2,9 @@
 Dual-Protocol Gateway (OSC + JSON-RPC)
 
 Starts both the OSC server (JUCE) and JSON-RPC server (Copilot-Liku CLI)
-using a shared ServerConfig. Each server currently manages its own worker,
-but they share ports/config for consistent behavior. Intended as a single
-entrypoint so Copilot and JUCE can run side-by-side without manual setup.
+using a shared ServerConfig and a single shared GenerationWorker.
+Callbacks are routed back to the originating protocol so JSON-RPC tasks
+do not leak unsolicited OSC notifications into JUCE (and vice versa).
 """
 
 from __future__ import annotations
@@ -12,16 +12,17 @@ from __future__ import annotations
 import signal
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from .config import ServerConfig
 from .osc_server import MusicGenOSCServer
 from .jsonrpc_server import MusicGenJSONRPCServer
-from .worker import GenerationWorker
+from .worker import GenerationResult, GenerationWorker
 
 
 class GatewayServer:
-    """Boots OSC and JSON-RPC servers together."""
+    """Boots OSC and JSON-RPC servers together on a shared GenerationWorker."""
 
     def __init__(
         self,
@@ -45,14 +46,15 @@ class GatewayServer:
         # Default log file for GUI-embedded runs (stdout isn't visible).
         if not self.config.log_file:
             try:
-                from pathlib import Path
-
-                self.config.log_file = str(Path(self.config.default_output_dir) / "gateway.log")
+                base_output = self.config.default_output_dir or "output"
+                self.config.log_file = str(Path(base_output) / "gateway.log")
             except Exception:
                 pass
-        self.osc_host = osc_host
-        self.osc_recv_port = osc_recv_port
-        self.osc_send_port = osc_send_port
+
+        # Keep gateway host/port attributes synchronized with self.config.
+        self.osc_host = self.config.host
+        self.osc_recv_port = self.config.recv_port
+        self.osc_send_port = self.config.send_port
         self.jsonrpc_host = jsonrpc_host
         self.jsonrpc_port = jsonrpc_port
 
@@ -62,47 +64,92 @@ class GatewayServer:
         self._running = False
 
     # ------------------------------------------------------------------ #
-    # Callback fan-out helpers so both servers get updates
+    # Task-origin-aware callback routing
     # ------------------------------------------------------------------ #
 
+    def _task_owner(self, task_id: Optional[str]) -> Optional[str]:
+        """Identify which protocol server submitted *task_id* ('osc', 'jsonrpc', or None)."""
+        if not task_id:
+            return None
+
+        in_osc = False
+        if self._osc_server is not None:
+            owned = getattr(self._osc_server, "_owned_task_ids", None)
+            if isinstance(owned, set) and task_id in owned:
+                in_osc = True
+
+        in_json = False
+        if self._json_server is not None:
+            progress_lock = getattr(self._json_server, "_progress_lock", None)
+            progress_map = getattr(self._json_server, "_progress", None)
+            if progress_lock is not None and isinstance(progress_map, dict):
+                with progress_lock:
+                    in_json = task_id in progress_map
+            elif isinstance(progress_map, dict):
+                in_json = task_id in progress_map
+
+        if in_osc and not in_json:
+            return "osc"
+        if in_json and not in_osc:
+            return "jsonrpc"
+        return None
+
+    def _current_task_id(self) -> Optional[str]:
+        if self._worker is None:
+            return None
+        return self._worker.get_current_task_id()
+
     def _dispatch_progress(self, step: str, percent: float, message: str) -> None:
-        """Fan progress updates to both servers if they exist."""
-        if self._json_server:
+        """Route progress updates to the originating protocol server."""
+        owner = self._task_owner(self._current_task_id())
+        if self._json_server and owner in ("jsonrpc", None):
             try:
-                self._json_server._on_progress(step, percent, message)  # type: ignore[attr-defined]
+                self._json_server._on_progress(step, percent, message)
             except Exception:
                 pass
-        if self._osc_server:
+        if self._osc_server and owner in ("osc", None):
             try:
-                self._osc_server._on_progress(step, percent, message)  # type: ignore[attr-defined]
+                self._osc_server._on_progress(step, percent, message)
             except Exception:
                 pass
 
-    def _dispatch_complete(self, result) -> None:
-        """Fan completion to both servers if they exist."""
-        if self._json_server:
+    def _dispatch_complete(self, result: GenerationResult) -> None:
+        """Route completion to the originating protocol server."""
+        task_id = getattr(result, "task_id", None)
+        owner = self._task_owner(task_id)
+        if self._json_server and owner in ("jsonrpc", None):
             try:
-                self._json_server._on_complete(result)  # type: ignore[attr-defined]
+                self._json_server._on_complete(result)
             except Exception:
                 pass
-        if self._osc_server:
+        if self._osc_server and owner in ("osc", None):
             try:
-                self._osc_server._on_generation_complete(result)  # type: ignore[attr-defined]
+                self._osc_server._on_generation_complete(result)
             except Exception:
                 pass
+            if task_id:
+                owned = getattr(self._osc_server, "_owned_task_ids", None)
+                if isinstance(owned, set):
+                    owned.discard(task_id)
 
     def _dispatch_error(self, code: int, message: str) -> None:
-        """Fan errors to both servers if they exist."""
-        if self._json_server:
+        """Route worker errors to the originating protocol server."""
+        task_id = self._current_task_id()
+        owner = self._task_owner(task_id)
+        if self._json_server and owner in ("jsonrpc", None):
             try:
-                self._json_server._on_error(code, message)  # type: ignore[attr-defined]
+                self._json_server._on_error(code, message)
             except Exception:
                 pass
-        if self._osc_server:
+        if self._osc_server and owner in ("osc", None):
             try:
-                self._osc_server._on_error(code, message)  # type: ignore[attr-defined]
+                self._osc_server._on_error(code, message)
             except Exception:
                 pass
+            if task_id:
+                owned = getattr(self._osc_server, "_owned_task_ids", None)
+                if isinstance(owned, set):
+                    owned.discard(task_id)
 
     def start(self) -> None:
         """Start both servers (blocking)."""
@@ -121,14 +168,28 @@ class GatewayServer:
         self._running = True
 
     def stop(self) -> None:
-        """Stop both servers gracefully."""
+        """Stop both servers and shut down the shared worker exactly once."""
         self._running = False
+        shared_worker = self._worker
         try:
             if self._osc_server:
+                # Detach shared worker so each server does not shut it down twice.
+                if self._osc_server._gen_worker is shared_worker:
+                    self._osc_server._gen_worker = None
                 self._osc_server.stop()
         finally:
-            if self._json_server:
-                self._json_server.stop()
+            try:
+                if self._json_server:
+                    if shared_worker is not None and self._json_server._worker is shared_worker:
+                        # Prevent duplicate shutdown inside json_server.stop().
+                        pass
+                    self._json_server.stop()
+            finally:
+                if shared_worker is not None:
+                    try:
+                        shared_worker.shutdown(wait=True, timeout=10.0)
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -136,7 +197,6 @@ class GatewayServer:
 
     def _start_servers(self, async_mode: bool = False) -> None:
         """Create and start OSC + JSON-RPC servers."""
-        # Shared worker
         if self._worker is None:
             self._worker = GenerationWorker(
                 max_workers=self.config.max_workers,
@@ -179,7 +239,7 @@ class GatewayServer:
         )
 
     def _install_signal_handlers(self) -> None:
-        def _handler(signum, _frame):
+        def _handler(signum: int, _frame: object) -> None:
             print(f"[Gateway] Caught signal {signum}, stopping...")
             self.stop()
 

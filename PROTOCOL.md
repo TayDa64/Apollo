@@ -1,15 +1,15 @@
-# OSC Protocol Reference
+# MUSE Server Protocol Reference (OSC & JSON-RPC 2.0)
 
-> **Version**: 1 (SCHEMA_VERSION)  
-> **Last Updated**: Synchronized with codebase
+> **Version**: 1 (`SCHEMA_VERSION`)  
+> **Last Updated**: Synchronized with `multimodal_gen/server/{config,osc_server,jsonrpc_server,gateway,worker}.py` and `juce/Source/Communication/Messages.h`
 
-This document is the **canonical reference** for the OSC protocol between the Python backend server and JUCE client.
+This document is the **canonical reference** for communication between the Python backend server (`multimodal_gen/server/`) and desktop/CLI clients (JUCE OSC client and JSON-RPC 2.0 HTTP clients).
 
 ---
 
-## Message Format
+## OSC Message Format
 
-All messages use OSC with JSON payloads. Each message includes a `schema_version` field for compatibility checking.
+All OSC messages carry a JSON string payload (except chunked expansion instrument transfers). Each payload includes `schema_version` for compatibility checks.
 
 ```
 /<address> <json_string>
@@ -21,19 +21,15 @@ All messages use OSC with JSON payloads. Each message includes a `schema_version
 |----------------|----------------|----------|
 | Equal | Equal | ✅ Proceed normally |
 | Older | Newer | ⚠️ Server warns, proceeds (backward compatible) |
-| Newer | Older | ❌ Server rejects with error code 103 (SCHEMA_VERSION_MISMATCH) |
-
-**Design Rationale**:
-- **Older clients → Newer servers**: Server accepts to ensure backward compatibility. The server logs a warning and continues processing. The JUCE client surfaces this via `onSchemaVersionWarning()` callback, displaying a status bar notice and optional dialog.
-- **Newer clients → Older servers**: Server rejects immediately. This prevents silent data loss if the client sends fields the server doesn't understand. The JUCE client receives error 103 and should prompt the user to update the server.
+| Newer | Older | ❌ Server rejects with error code `103` (`SCHEMA_VERSION_MISMATCH`) |
 
 **Implementation**:
-- Python: `multimodal_gen/server/osc_server.py` checks `schema_version` in `_validate_schema_version()`
-- JUCE: `juce/Source/Communication/OSCBridge.cpp` tracks `SCHEMA_VERSION` constant and `OSCBridge::Listener::onSchemaVersionWarning()`
+- Python: `multimodal_gen/server/osc_server.py` validates `schema_version` in `_validate_schema_version()` across `/generate`, `/analyze`, `/regenerate`, `/fx_chain`, `/controls/set`, and `/controls/clear`.
+- JUCE: `juce/Source/Communication/Messages.h` defines `static constexpr int SCHEMA_VERSION = 1;` and `OSCBridge::Listener::onSchemaVersionWarning()`.
 
 ---
 
-## Client → Server Messages
+## OSC Client → Server Messages
 
 ### `/generate`
 Start a music generation request.
@@ -44,10 +40,24 @@ Start a music generation request.
   "schema_version": 1,
   "request_id": "uuid-string",
   "prompt": "Make a G-Funk beat at 92 BPM in A minor",
+  "genre": "g_funk",
   "bpm": 92,
   "key": "A",
   "mode": "minor",
   "duration_bars": 8,
+  "num_takes": 1,
+  "output_dir": "",
+  "soundfont": "",
+  "instruments": [],
+  "reference_url": "",
+  "reference_bpm": 0,
+  "reference_key": "",
+  "reference_genre": "",
+  "score_plan": null,
+  "render_audio": true,
+  "export_stems": false,
+  "export_mpc": false,
+  "verbose": false,
   "options": {
     "tension_arc_shape": "linear_build",
     "tension_intensity": 0.8,
@@ -56,16 +66,16 @@ Start a music generation request.
     "preset": "legendary",
     "style_preset": "g_funk_90s",
     "production_preset": "wide_modern",
+    "orchestral_stage_preset": "epic",
     "seed": 123
   }
 }
 ```
 
 **Notes:**
-- All fields are optional except `schema_version`, `request_id`, and `prompt`.
-- `options.*` fields are backward-compatible: older clients can send `options: {}` and get default behavior.
-- Some implementations also accept these keys at the top-level (e.g., `tension_intensity`) for convenience; prefer `options` for forward compatibility.
-- Backward compatibility: some clients use `bars` instead of `duration_bars`.
+- `prompt` is required unless a valid `score_plan` (`score_plan_v1`) supplies the prompt/plan.
+- `bars` is accepted as a backward-compatible alias for `duration_bars` (sent by JUCE `GenerationRequest::toJson()`).
+- Server-persisted `/controls/set` overrides are merged beneath per-request `options` (explicit request fields take precedence).
 
 ### `/cancel`
 Cancel an in-progress generation.
@@ -74,9 +84,14 @@ Cancel an in-progress generation.
 ```json
 {
   "schema_version": 1,
+  "task_id": "optional-task-id",
   "request_id": "uuid-to-cancel"
 }
 ```
+
+**Notes:**
+- May also be sent with no JSON arguments to cancel the active task.
+- Server responds with `/status` (`status: "cancelled"`).
 
 ### `/regenerate`
 Regenerate a specific bar range of the current project (sectional regeneration).
@@ -103,6 +118,7 @@ Regenerate a specific bar range of the current project (sectional regeneration).
     "preset": "legendary",
     "style_preset": "g_funk_90s",
     "production_preset": "wide_modern",
+    "orchestral_stage_preset": "epic",
     "seed": 123
   }
 }
@@ -111,15 +127,15 @@ Regenerate a specific bar range of the current project (sectional regeneration).
 **Fields:**
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| start_bar | int | ✅ | 0-indexed starting bar |
-| end_bar | int | ✅ | 0-indexed ending bar (exclusive) |
-| tracks | string[] | ⚪ | Empty = all tracks; otherwise specific track names |
-| seed_strategy | string | ⚪ | "new" for fresh seed, "derived" to vary existing |
-| prompt | string | ⚪ | Optional override prompt for this section |
-| options | object | ⚪ | Generation context (bpm, key, mode, genre) |
+| `start_bar` | int | ✅ | 0-indexed starting bar |
+| `end_bar` | int | ✅ | 0-indexed ending bar (exclusive) |
+| `tracks` | string[] | ⚪ | Empty = all tracks; otherwise specific track names |
+| `seed_strategy` | string | ⚪ | `"new"` for fresh seed, `"derived"` to vary existing |
+| `prompt` | string | ⚪ | Optional override prompt for this section |
+| `options` | object | ⚪ | Generation context (`bpm`, `key`, `mode`, `genre`, Phase 5.2 controls) |
 
 ### `/controls/set`
-Persist control overrides on the server. These overrides are merged into subsequent `/generate` and `/regenerate` requests.
+Persist control overrides on the server. Merged into subsequent `/generate` and `/regenerate` requests.
 
 **Payload:**
 ```json
@@ -134,11 +150,14 @@ Persist control overrides on the server. These overrides are merged into subsequ
     "preset": "legendary",
     "style_preset": "g_funk_90s",
     "production_preset": "wide_modern",
+    "orchestral_stage_preset": "epic",
     "duration_bars": 8,
     "seed": 123
   }
 }
 ```
+
+**Response**: `/status` with `status: "controls_updated"`, `request_id`, and `overrides`.
 
 ### `/controls/clear`
 Clear persisted control overrides.
@@ -153,28 +172,26 @@ Clear persisted control overrides.
 ```
 
 **Notes:**
-- If `keys` is omitted or empty, the server clears all overrides.
+- If `keys` is omitted or empty, all persisted overrides are cleared.
+- **Response**: `/status` with `status: "controls_cleared"`, `request_id`, `cleared`, and `overrides`.
 
 ### `/analyze`
-Analyze an audio file or URL for BPM, key, and other characteristics.
+Analyze a local audio/MIDI file or reference URL for BPM, key, and musical characteristics.
 
 **Payload:**
 ```json
 {
   "schema_version": 1,
   "request_id": "uuid-string",
-  "file_path": "/path/to/audio.wav",
-  "url": "https://...",
-  "options": {}
+  "path": "/path/to/audio.wav",
+  "url": "",
+  "verbose": false
 }
 ```
 
 **Notes:**
-- Provide either `file_path` OR `url`, not both.
-- **Engine routing**: 
-  - URL sources use `reference_analyzer.py` (requires librosa, yt-dlp)
-  - Local files also use `reference_analyzer.py` currently
-  - `file_analysis.py` is available as a lightweight alternative (offline-first, graceful degradation)
+- Provide either `path` (canonical; `file_path` is accepted as a legacy alias) OR `url`.
+- Local files route to `file_analysis.py` (offline-first, supports WAV/MIDI with graceful degradation when `librosa` is absent). URLs route to `reference_analyzer.py` (requires optional `librosa`/`yt-dlp`).
 
 ### `/fx_chain`
 Send FX chain configuration for offline render parity.
@@ -183,6 +200,7 @@ Send FX chain configuration for offline render parity.
 ```json
 {
   "schema_version": 1,
+  "request_id": "uuid-string",
   "fx_chain": {
     "master": [
       {
@@ -193,42 +211,33 @@ Send FX chain configuration for offline render parity.
           "midGain": 2.5,
           "highGain": -1.0
         }
-      },
-      {
-        "type": "compressor",
-        "enabled": true,
-        "params": {
-          "threshold": -12.0,
-          "ratio": 4.0,
-          "attack": 10.0,
-          "release": 100.0
-        }
       }
     ],
-    "drums": [...],
-    "bass": [...],
-    "melodic": [...]
+    "drums": [],
+    "bass": [],
+    "melodic": []
   }
 }
 ```
 
-**Notes:**
-- The server stores this configuration and applies it during the next generation.
-- FX chain is sent automatically when the user modifies FX in the JUCE UI.
-- Each track (master, drums, bass, melodic) has its own chain of effects.
+**Response**: `/status` with `status: "fx_chain_updated"`.
 
 ### `/instruments`
-Request a refresh of available instruments.
+Request a scan/refresh of available sample instruments.
 
 **Payload:**
 ```json
 {
-  "schema_version": 1
+  "schema_version": 1,
+  "paths": ["/path/to/kit1"],
+  "cache_dir": "/optional/cache/dir"
 }
 ```
+
+**Response**: `/status` (`status: "scan_started"`) followed asynchronously by `/instruments_loaded`.
 
 ### `/ping`
-Heartbeat to check server availability.
+Health check heartbeat.
 
 **Payload:**
 ```json
@@ -236,6 +245,8 @@ Heartbeat to check server availability.
   "schema_version": 1
 }
 ```
+
+**Response**: `/pong`.
 
 ### `/shutdown`
 Request graceful server shutdown.
@@ -248,27 +259,41 @@ Request graceful server shutdown.
 }
 ```
 
-### `/expansion/list`
-Request list of available expansions.
+**Response**: `/status` with `status: "shutdown_acknowledged"`, `request_id`, and `timestamp`.
 
-**Payload:**
-```json
-{
-  "schema_version": 1
-}
-```
+---
+
+## Expansion Management (Client → Server)
+
+### `/expansion/list`
+List loaded expansions and categories.
+- **Payload**: `{}` (optional `schema_version`)
+- **Response**: `/expansion/list_response`
+
+### `/expansion/instruments`
+List instruments belonging to an expansion pack.
+- **Payload**: `{"expansion_id": "funk_o_rama"}`
+- **Response**: `/expansion/instruments_response` (single JSON string if `<= 8000` chars) OR chunked `/expansion/instruments_chunk` messages (`expansion_id, idx, total, chunk`) to avoid UDP datagram truncation (`WinError 10040`).
+
+### `/expansion/resolve`
+Resolve an instrument name with intelligent genre-aware matching.
+- **Payload**: `{"instrument": "krar", "genre": "eskista"}`
+- **Response**: `/expansion/resolve_response`
+
+### `/expansion/import`
+Import an expansion pack from disk.
+- **Payload**: `{"path": "/path/to/expansion"}`
+- **Response**: `/status` (`status: "expansion_imported"`, `path`)
+
+### `/expansion/scan`
+Scan a directory for expansion packs.
+- **Payload**: `{"directory": "/path/to/expansions"}`
+- **Response**: `/status` (`status: "expansion_scan_complete"`, `directory`, `count`)
 
 ### `/expansion/enable`
 Enable or disable an expansion pack.
-
-**Payload:**
-```json
-{
-  "schema_version": 1,
-  "expansion_id": "expansion-uuid",
-  "enabled": true
-}
-```
+- **Payload**: `{"expansion_id": "funk_o_rama", "enabled": true}`
+- **Response**: `/status` (`status: "expansion_enable_changed"`, `expansion_id`, `enabled`)
 
 ---
 
@@ -276,8 +301,6 @@ Enable or disable an expansion pack.
 
 ### `/take/select`
 Select a specific take for a track during audition.
-
-**Payload:**
 ```json
 {
   "request_id": "uuid-string",
@@ -285,11 +308,10 @@ Select a specific take for a track during audition.
   "take_id": "take_001"
 }
 ```
+**Response**: `/take/selected`.
 
 ### `/take/comp`
-Composite takes across bar regions (pick best sections from multiple takes).
-
-**Payload:**
+Composite takes across bar regions.
 ```json
 {
   "request_id": "uuid-string",
@@ -300,11 +322,10 @@ Composite takes across bar regions (pick best sections from multiple takes).
   ]
 }
 ```
+**Response**: `/status` (`status: "comp_regions_set"`, `request_id`, `track`, `region_count`).
 
 ### `/take/render`
-Render a specific take or comp to audio.
-
-**Payload:**
+Render a specific take or whole-project selected/comp arrangement to WAV audio.
 ```json
 {
   "request_id": "uuid-string",
@@ -314,33 +335,34 @@ Render a specific take or comp to audio.
   "output_path": "/output/drums_take.wav"
 }
 ```
-
 **Notes:**
-- If `use_comp` is true, the server renders the comp regions instead of a single take
-- `output_path` is optional; server will use default output directory if not provided
+- Trackless `{"track": "", "take_id": "", "use_comp": true, "output_path": "/output"}` renders the latest whole-project arrangement using selected/comp tracks.
+- **Response**: `/take/rendered` on success, or `/error` on failure.
 
 ---
 
-## Server → Client Messages
+## OSC Server → Client Messages
 
 ### `/status`
-General status updates (generation started, cancelled, etc.).
+General status and command acknowledgment updates.
 
 **Payload:**
 ```json
 {
   "schema_version": 1,
-  "status": "generation_started",
+  "status": "generating",
+  "task_id": "abc12345",
   "request_id": "uuid-string",
-  "message": "Generation started"
+  "prompt": "Make a G-Funk beat..."
 }
 ```
 
-**Status values:**
-- `generation_started` - Generation began
-- `generation_cancelled` - Generation was cancelled
-- `shutdown_ack` - Shutdown acknowledged
-- `connected` - Connection established
+**Observed `status` values:**
+- `generating`, `regeneration_started`, `cancelled`
+- `controls_updated`, `controls_cleared`, `fx_chain_updated`
+- `scan_started`, `comp_regions_set`
+- `expansion_imported`, `expansion_scan_complete`, `expansion_enable_changed`
+- `shutdown_acknowledged`
 
 ### `/progress`
 Progress updates during generation.
@@ -350,85 +372,114 @@ Progress updates during generation.
 {
   "schema_version": 1,
   "request_id": "uuid-string",
-  "stage": "generating_drums",
-  "progress": 0.45,
-  "message": "Generating drum pattern..."
+  "step": "generating_midi",
+  "percent": 0.35,
+  "message": "Generating MIDI..."
 }
 ```
 
 ### `/complete`
-Generation completed successfully.
+Generation completed successfully (`GenerationResult.to_dict()`).
 
 **Payload:**
 ```json
 {
   "schema_version": 1,
+  "task_id": "abc12345",
   "request_id": "uuid-string",
+  "success": true,
   "midi_path": "/path/to/output.mid",
-  "bpm": 92,
-  "key": "A",
-  "mode": "minor",
-  "duration_seconds": 21.74,
-  "tracks": ["drums", "bass", "keys", "lead"]
+  "audio_path": "/path/to/output.wav",
+  "stems_path": "",
+  "mpc_path": "",
+  "render_report_path": "/path/to/output_render_report.json",
+  "renderer_path": "fluidsynth",
+  "pipeline_stages": {
+    "fluidsynth_file_mastering.status": "applied"
+  },
+  "track_programs": [
+    {
+      "track_name": "Bass",
+      "source_quality": "gm_soundfont_baseline",
+      "gm_program_names": ["Electric Bass Pick"],
+      "effective_programs": [34],
+      "patch_family": "bass"
+    }
+  ],
+  "metadata": {
+    "bpm": 92,
+    "key": "A",
+    "genre": "g_funk",
+    "sections": [{"name": "Intro", "bars": 4}]
+  },
+  "duration": 21.74,
+  "samples_generated": 0,
+  "instruments_used": [],
+  "instrument_patches": [],
+  "takes": [],
+  "error_code": 0,
+  "error_message": ""
 }
 ```
 
 ### `/error`
-Error occurred during processing.
+Structured error notification.
 
 **Payload:**
 ```json
 {
   "schema_version": 1,
   "request_id": "uuid-string",
-  "error_code": 100,
-  "message": "Generation failed: Invalid prompt"
+  "code": 200,
+  "message": "Generation failed: Invalid prompt",
+  "recoverable": true
 }
 ```
 
-**Error codes (from config.py):**
-| Code | Name | Description |
-|------|------|-------------|
-| 100 | GENERATION_FAILED | General generation failure |
-| 101 | INVALID_REQUEST | Malformed request |
-| 102 | SERVER_BUSY | Server cannot accept new requests |
-| 103 | SCHEMA_VERSION_MISMATCH | Client schema newer than server |
-| 200 | ANALYSIS_FAILED | Analysis operation failed |
-
 ### `/analyze_result`
-Analysis completed with results.
+Analysis completed with nested `analysis` object and routing metadata.
 
 **Payload:**
 ```json
 {
   "schema_version": 1,
   "request_id": "uuid-string",
-  "bpm": 98.5,
-  "bpm_confidence": 0.85,
-  "key": "G",
-  "mode": "minor",
-  "key_confidence": 0.72,
-  "genre": "hip-hop",
-  "genre_confidence": 0.68,
-  "prompt_hints": "98 BPM hip-hop track in G minor with punchy drums",
-  "duration_seconds": 180.5
+  "success": true,
+  "source_kind": "file",
+  "analyzer": "file_analysis",
+  "analysis": {
+    "bpm": 98.5,
+    "bpm_confidence": 0.85,
+    "key": "G",
+    "mode": "minor",
+    "key_confidence": 0.72,
+    "estimated_genre": "hip-hop",
+    "genre_confidence": 0.68,
+    "style_tags": ["punchy"]
+  },
+  "prompt_hints": "98 BPM hip-hop track in G minor",
+  "generation_params": {
+    "bpm": 98.5,
+    "key": "G",
+    "mode": "minor"
+  },
+  "warnings": []
 }
 ```
 
 ### `/pong`
 Response to `/ping`.
-
-**Payload:**
 ```json
 {
-  "schema_version": 1
+  "schema_version": 1,
+  "status": "ok",
+  "busy": false,
+  "timestamp": 1735689600.0
 }
 ```
 
 ### `/instruments_loaded`
-Response with available instruments.
-
-**Payload:**
+Response with scanned sample instruments.
 ```json
 {
   "schema_version": 1,
@@ -437,290 +488,100 @@ Response with available instruments.
   "count": 150,
   "categories": ["drums", "bass", "keys", "synths", "strings", "brass", "fx"],
   "sources": {
-    "/path/to/instruments": 120,
-    "/path/to/expansions/funk": 30
+    "/path/to/instruments": 120
   },
-  "instruments": {
-    "drums": [
-      {
-        "id": "uuid-string",
-        "name": "Tight Kick 01",
-        "filename": "tight_kick_01.wav",
-        "path": "/path/to/instruments/drums/tight_kick_01.wav",
-        "absolute_path": "/path/to/instruments/drums/tight_kick_01.wav",
-        "category": "drums",
-        "subcategory": "kicks",
-        "tags": ["punchy", "tight", "hip-hop"],
-        "key": "",
-        "bpm": 0,
-        "duration_ms": 450.5,
-        "file_size_bytes": 98304,
-        "favorite": false,
-        "play_count": 0
-      }
-    ],
-    "bass": [...],
-    "keys": [...]
-  }
+  "instruments": {}
 }
 ```
 
-**Instrument fields:**
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| id | string | ✅ | Unique identifier (UUID) |
-| name | string | ✅ | Display name |
-| filename | string | ✅ | File name only |
-| path | string | ✅ | Relative or absolute path |
-| absolute_path | string | ✅ | Full absolute path |
-| category | string | ✅ | Category from enum (drums, bass, keys, etc.) |
-| subcategory | string | ⚪ | Sub-category if applicable |
-| tags | string[] | ⚪ | Descriptive tags for search/matching |
-| key | string | ⚪ | Musical key (e.g., "C", "F#") |
-| bpm | number | ⚪ | BPM for loops, 0 if not applicable |
-| duration_ms | number | ⚪ | Duration in milliseconds |
-| file_size_bytes | number | ⚪ | File size |
-| favorite | boolean | ⚪ | User marked as favorite |
-| play_count | number | ⚪ | Usage tracking |
-```
+### Expansion Responses
+- `/expansion/list_response`: `{"schema_version": 1, "expansions": [...], "categories": [...]}`
+- `/expansion/instruments_response`: JSON array of instrument objects (when `<= 8000` chars)
+- `/expansion/instruments_chunk`: 4 OSC arguments `(expansion_id: str, idx: int, total: int, chunk: str)`
+- `/expansion/resolve_response`: JSON serialization of `ResolvedInstrument.to_dict()`
 
-### `/expansion/list_response`
-List of available expansions.
+### Take Responses
+- `/takes/available`: `{"request_id": "...", "tracks": {...}}`
+- `/take/selected`: `{"schema_version": 1, "request_id": "...", "track": "...", "take_id": "...", "success": true}`
+- `/take/rendered`: `{"schema_version": 1, "request_id": "...", "track": "...", "take_id": "...", "output_path": "...", "success": true}`
 
-**Payload:**
-```json
-{
-  "schema_version": 1,
-  "expansions": [
-    {
-      "id": "funk_o_rama",
-      "name": "Funk-O-Rama",
-      "version": "1.0.5",
-      "enabled": true,
-      "instrument_count": 48
-    }
-  ]
-}
-```
-
-### `/expansion/enable_response`
-Acknowledgment of enable/disable.
-
-**Payload:**
-```json
-{
-  "schema_version": 1,
-  "expansion_id": "funk_o_rama",
-  "enabled": true,
-  "success": true
-}
-```
+### Intelligence Push Notifications (`/intel/*`)
+Server-initiated push notifications emitted by `MusicGenOSCServer.notify_*`:
+- `/intel/genre_dna`: `{"genre": "...", "vector": {...}}`
+- `/intel/preference`: `{"dimension": "...", "old_value": 0.5, "new_value": 0.65}`
+- `/intel/search`: `{"query": "...", "count": 5, "top": [{"name": "...", "score": 0.91}]}`
+- `/intel/compressed`: `{"level": "2", "token_budget": 1024}`
+- `/intel/fusion`: `{"name": "...", "sources": [...], "distance": "moderate"}`
+- `/intel/exploration`: exploration suggestion JSON object
 
 ---
 
-## Take Responses (Server → Client)
+## JSON-RPC 2.0 HTTP Protocol & Dual-Protocol Gateway
 
-### `/takes/available`
-Sent after generation when multiple takes were requested. Provides available take lanes for audition.
+In addition to OSC, MUSE exposes an HTTP JSON-RPC 2.0 server (`multimodal_gen/server/jsonrpc_server.py`, default `http://127.0.0.1:8765`, backed by `ThreadingHTTPServer`) and a dual-protocol gateway (`multimodal_gen/server/gateway.py`) sharing one `GenerationWorker` with strict task-origin callback isolation so JSON-RPC jobs do not leak unsolicited OSC notifications to JUCE.
 
-**Payload:**
-```json
-{
-  "request_id": "uuid-string",
-  "tracks": {
-    "drums": [
-      {
-        "take_id": "take_001",
-        "seed": 12345,
-        "variation_type": "rhythm",
-        "midi_path": "/output/drums_take_001.mid"
-      },
-      {
-        "take_id": "take_002",
-        "seed": 67890,
-        "variation_type": "rhythm",
-        "midi_path": "/output/drums_take_002.mid"
-      }
-    ],
-    "bass": [
-      {
-        "take_id": "take_001",
-        "seed": 11111,
-        "variation_type": "pitch",
-        "midi_path": "/output/bass_take_001.mid"
-      }
-    ]
-  }
-}
-```
+### CLI Launch Modes (`python -m multimodal_gen.server`)
+- OSC only (default): `python -m multimodal_gen.server --port 9000 --send-port 9001`
+- JSON-RPC only: `python -m multimodal_gen.server --jsonrpc --port 8765`
+- Dual-protocol Gateway: `python -m multimodal_gen.server --gateway --port 9000 --send-port 9001 --jsonrpc-port 8765`
 
-**Take fields:**
-| Field | Type | Description |
-|-------|------|-------------|
-| take_id | string | Unique identifier for this take |
-| seed | int | Random seed used (for reproducibility) |
-| variation_type | string | Type of variation ("rhythm", "pitch", "timing", "combined") |
-| midi_path | string | Path to take MIDI file |
-
-### `/take/selected`
-Confirmation that a take was selected.
-
-**Payload:**
-```json
-{
-  "request_id": "uuid-string",
-  "track": "drums",
-  "take_id": "take_001",
-  "success": true
-}
-```
-
-### `/take/rendered`
-Confirmation that a take or comp was rendered to audio.
-
-**Payload:**
-```json
-{
-  "request_id": "uuid-string",
-  "track": "drums",
-  "take_id": "take_001",
-  "output_path": "/output/drums_take_001.wav",
-  "success": true
-}
-```
+### Supported JSON-RPC 2.0 Methods
+| Method | Description |
+|--------|-------------|
+| `generate` | Submit async generation job; returns `{task_id, status}` |
+| `generate_sync` | Run generation synchronously and return `GenerationResult` dict |
+| `produce_sync` | Run full production workflow (optional `score_plan` + critics) synchronously |
+| `get_status` | Poll task progress or cached result by `task_id` |
+| `cancel` | Cancel active or specific `task_id` |
+| `analyze_reference` | Analyze local audio/MIDI path or reference URL |
+| `run_critics` | Run symbolic critics on inline feature arrays (`voicings`, `bass_notes`, `kick_ticks`, `tension_curve`, `note_density_per_beat`) OR on an existing `midi_path` |
+| `run_critics_midi` | Extract features from a `.mid` file and run symbolic critics |
+| `genre_dna_lookup` | Lookup genre DNA vector |
+| `genre_blend` | Blend two or more genre DNA vectors |
+| `session_state` | Return latest `SessionGraph` state |
+| `midi_bridge_status` | Inspect MIDI bridge connectivity |
+| `midi_bridge_play` | Stream MIDI file over MIDI bridge |
+| `search_assets` / `build_index` | Semantic asset search and embedding index build |
+| `get_preferences` / `record_preference` | Read or record user preference signals |
+| `analyze_output` | Run post-render audio/MIDI output analysis |
+| `ping` / `shutdown` | Health check and graceful server shutdown |
 
 ---
 
-## Generation Lifecycle States
+## Error Codes Reference (`multimodal_gen/server/config.py`)
 
-The generation state machine defines the valid states and transitions for a generation request.
-
-### State Diagram
-```
-┌─────────────┐
-│    IDLE     │ ◄─────────────────────────────────────────┐
-└──────┬──────┘                                           │
-       │                                                  │
-       │ Client sends /generate                           │
-       ▼                                                  │
-┌─────────────┐    Client sends /cancel    ┌─────────────┐│
-│   STARTED   │───────────────────────────►│  CANCELLED  ││
-│ (ack phase) │                            └──────┬──────┘│
-└──────┬──────┘                                   │       │
-       │                                          │ timeout│
-       │ Server sends /status                     └───────┤
-       │ {status:"generation_started"}                    │
-       ▼                                                  │
-┌─────────────┐    Client sends /cancel    ┌─────────────┐│
-│ IN_PROGRESS │───────────────────────────►│  CANCELLED  ││
-│ (0% - 99%)  │                            └──────┬──────┘│
-└──────┬──────┘                                   │       │
-       │                                          │       │
-       │ Server sends /progress (0.0 → 1.0)       │       │
-       │                                          │       │
-       ├──────────────────────────────────────────┴───────┤
-       │                                                  │
-       ▼                                                  │
-┌─────────────┐    ────────────────────────────────►──────┘
-│  COMPLETE   │    (UI returns to IDLE)
-│    100%     │
-└─────────────┘
-
-       │ OR (error occurs)
-       ▼
-┌─────────────┐    ────────────────────────────────►──────┘
-│    ERROR    │    (UI returns to IDLE)
-└─────────────┘
-```
-
-### State Definitions
-
-| State | Description | Messages | Next States |
-|-------|-------------|----------|-------------|
-| **IDLE** | No active generation. UI accepts input. | — | STARTED |
-| **STARTED** | `/generate` sent, awaiting server acknowledgment | `/generate` sent | IN_PROGRESS, CANCELLED, ERROR |
-| **IN_PROGRESS** | Generation active, receiving `/progress` updates | `/status`, `/progress` | COMPLETE, CANCELLED, ERROR |
-| **COMPLETE** | Generation finished successfully | `/complete` | IDLE |
-| **CANCELLED** | User requested cancel, awaiting confirmation | `/cancel` sent → `/status {cancelled}` | IDLE |
-| **ERROR** | Generation failed | `/error` | IDLE |
-
-### State Invariants
-
-1. **Request ID Correlation**: All messages related to a generation include the same `request_id`. The client MUST ignore `/progress` or `/complete` with mismatched IDs.
-
-2. **Timeout Handling**: If no `/progress` or `/complete` is received within `ACTIVITY_TIMEOUT_MS` (default: 30000ms), the client transitions back to IDLE.
-
-3. **Cancel Semantics**: `/cancel` is fire-and-forget. The server may respond with either:
-   - `/status` with `status: "generation_cancelled"`
-   - `/complete` (if generation finished before cancel arrived)
-   
-4. **Idempotent Cancel**: Calling `/cancel` multiple times or when not in a generation state is safe (server ignores).
-
-5. **UI Blocking**: While in STARTED or IN_PROGRESS states:
-   - Generate button shows "Cancel" action
-   - Prompt input may be disabled or read-only
-   - Progress indicator shows current `progress` percentage
-
-### JUCE Implementation
-
-```cpp
-// In OSCBridge.h
-enum class ConnectionState {
-    DISCONNECTED,
-    CONNECTING,
-    CONNECTED,
-    RECONNECTING
-};
-
-// Generation-specific state tracking
-bool isGenerating = false;           // True when in STARTED or IN_PROGRESS
-juce::String currentRequestId;       // Tracks active generation
-double lastActivityTime;             // For timeout detection
-```
-
-### Python Implementation
-
-```python
-# In worker.py
-class GenerationRequest:
-    request_id: str
-    # ... other fields
-    
-class GenerationResult:
-    request_id: str  # Echoed back for correlation
-    success: bool
-    midi_path: Optional[str]
-    error_message: Optional[str]
-```
+| Code | Name | Description |
+|------|------|-------------|
+| `100` | `UNKNOWN` | Unclassified server error |
+| `101` | `INVALID_MESSAGE` | Malformed JSON or invalid field value |
+| `102` | `MISSING_PARAMETER` | Required field omitted |
+| `103` | `SCHEMA_VERSION_MISMATCH` | Client `schema_version` is newer than server `SCHEMA_VERSION` |
+| `200` | `GENERATION_FAILED` | General generation failure |
+| `201` | `GENERATION_TIMEOUT` | Generation exceeded timeout |
+| `202` | `GENERATION_CANCELLED` | Generation cancelled by client |
+| `203` | `INVALID_PROMPT` | Prompt rejected |
+| `300` | `AUDIO_RENDER_FAILED` | Offline audio rendering failed |
+| `301` | `SOUNDFONT_NOT_FOUND` | Requested SoundFont does not exist |
+| `302` | `FLUIDSYNTH_NOT_AVAILABLE` | FluidSynth executable unavailable |
+| `400` | `INSTRUMENTS_NOT_FOUND` | No instruments found |
+| `401` | `INSTRUMENT_ANALYSIS_FAILED` | Sample/instrument analysis failed |
+| `500` | `FILE_NOT_FOUND` | Referenced file not found on disk |
+| `501` | `FILE_WRITE_FAILED` | Failed to write output artifact |
+| `502` | `OUTPUT_DIR_NOT_WRITABLE` | Output directory cannot be created or written |
+| `600` | `OPTIONAL_DEPENDENCY_MISSING` | Optional library (`librosa`, `yt-dlp`, `mido`, etc.) not installed |
+| `700` | `ANALYZE_FAILED` | Reference/file analysis failed |
+| `900` | `SERVER_BUSY` | Server cannot accept new generation request |
+| `901` | `WORKER_CRASHED` | Worker thread crashed (non-recoverable) |
+| `902` | `SHUTDOWN_IN_PROGRESS` | Server is shutting down (non-recoverable) |
 
 ---
 
 ## Source Files
 
 - **Python Server Config**: `multimodal_gen/server/config.py`
-- **Python OSC Handler**: `multimodal_gen/server/osc_server.py`
+- **Python OSC Server**: `multimodal_gen/server/osc_server.py`
+- **Python JSON-RPC Server**: `multimodal_gen/server/jsonrpc_server.py`
+- **Python Dual-Protocol Gateway**: `multimodal_gen/server/gateway.py`
+- **Python Worker**: `multimodal_gen/server/worker.py`
 - **JUCE Messages**: `juce/Source/Communication/Messages.h`
 - **JUCE OSC Bridge**: `juce/Source/Communication/OSCBridge.cpp`
-
----
-
-## Deprecated / Removed
-
-| Old Name | Current Status | Notes |
-|----------|----------------|-------|
-| `/analyze_complete` (OSC address) | Never existed | `analyze_complete` is used as a progress stage name in `file_analysis.py`, not an OSC address. The actual response is `/analyze_result`. |
-
----
-
-## Error Codes Reference
-
-For complete error code definitions, see `multimodal_gen/server/config.py`:
-
-| Code Range | Category | Examples |
-|------------|----------|----------|
-| 100-199 | General errors | 100: UNKNOWN, 101: INVALID_MESSAGE, 103: SCHEMA_VERSION_MISMATCH |
-| 200-299 | Generation errors | 200: GENERATION_FAILED, 201: TIMEOUT, 202: CANCELLED |
-| 300-399 | Audio errors | 300: AUDIO_RENDER_FAILED, 301: SOUNDFONT_NOT_FOUND |
-| 400-499 | Instrument errors | 400: INSTRUMENTS_NOT_FOUND, 401: ANALYSIS_FAILED |
-| 500-599 | File errors | 500: FILE_NOT_FOUND, 501: FILE_WRITE_FAILED |
-| 900-999 | Server errors | 900: SERVER_BUSY, 901: WORKER_CRASHED |

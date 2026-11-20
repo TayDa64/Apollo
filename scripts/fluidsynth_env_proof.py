@@ -56,6 +56,7 @@ def _find_repo_root() -> Path:
 
 def _load_fluidsynth_runtime():
     """Import the shared FluidSynth runtime helper from a standalone script context."""
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     repo_root = _find_repo_root()
     repo_root_str = str(repo_root)
     if repo_root_str not in sys.path:
@@ -182,12 +183,60 @@ def _extract_mastering_indicators(render_report: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def check_environment(soundfont: Optional[str] = None) -> Dict[str, Any]:
+    """Probe local FluidSynth and SoundFont prerequisites without writing files."""
+    repo_root = _find_repo_root()
+    fluidsynth_runtime = _load_fluidsynth_runtime()
+
+    fluidsynth_executable = fluidsynth_runtime.resolve_fluidsynth_executable()
+    probe_executable, probe_available, probe_version = fluidsynth_runtime.probe_fluidsynth(
+        fluidsynth_executable
+    )
+    discovered_soundfont = _find_soundfont(repo_root, soundfont)
+
+    missing = []
+    if not probe_available:
+        missing.append("fluidsynth_executable")
+    if discovered_soundfont is None:
+        missing.append("soundfont")
+
+    return {
+        "schema_version": 2,
+        "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "python": sys.executable,
+        "repo_root": str(repo_root),
+        "ready": bool(probe_available and discovered_soundfont is not None),
+        "fluidsynth_probe": {
+            "executable": probe_executable or fluidsynth_executable,
+            "available": bool(probe_available),
+            "version": probe_version,
+        },
+        "soundfont": str(discovered_soundfont) if discovered_soundfont is not None else None,
+        "missing": missing,
+    }
+
+
 def run_proof(args: argparse.Namespace) -> ProofPaths:
     repo_root = _find_repo_root()
     fluidsynth_runtime = _load_fluidsynth_runtime()
     main_py = repo_root / "main.py"
     if not main_py.exists():
         raise FileNotFoundError(f"main.py not found at expected path: {main_py}")
+
+    env = dict(os.environ)
+    env.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    fluidsynth_executable = fluidsynth_runtime.resolve_fluidsynth_executable()
+    probe_executable, probe_available, probe_version = fluidsynth_runtime.probe_fluidsynth(
+        fluidsynth_executable
+    )
+
+    # Resolve SoundFont BEFORE creating any output directories so missing
+    # local prerequisites never leave empty orphan proof folders behind.
+    soundfont = _find_soundfont(repo_root, args.soundfont)
+    if soundfont is None:
+        raise FileNotFoundError(
+            "No SoundFont found. Provide --soundfont or place one under assets/soundfonts/."
+        )
 
     output_root = Path(args.output_root)
     if not output_root.is_absolute():
@@ -206,18 +255,6 @@ def run_proof(args: argparse.Namespace) -> ProofPaths:
     diagnose_stderr_path = run_dir / "diagnose_audio_stderr.txt"
     gen_stdout_path = run_dir / "generation_stdout.txt"
     gen_stderr_path = run_dir / "generation_stderr.txt"
-
-    env = dict(os.environ)
-    fluidsynth_executable = fluidsynth_runtime.resolve_fluidsynth_executable()
-    probe_executable, probe_available, probe_version = fluidsynth_runtime.probe_fluidsynth(
-        fluidsynth_executable
-    )
-
-    soundfont = _find_soundfont(repo_root, args.soundfont)
-    if soundfont is None:
-        raise FileNotFoundError(
-            "No SoundFont found. Provide --soundfont or place one under assets/soundfonts/."
-        )
 
     # 1) Diagnose proof
     diagnose_cmd = [
@@ -352,8 +389,18 @@ def main() -> int:
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--duration-bars", type=int, default=4)
     parser.add_argument("--seed", type=int, default=49049)
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Probe FluidSynth and SoundFont prerequisites without creating output directories or rendering audio (exit 0 if ready, 2 otherwise).",
+    )
 
     args = parser.parse_args()
+    if args.check_only:
+        report = check_environment(args.soundfont)
+        print(json.dumps(report, indent=2))
+        return 0 if report["ready"] else 2
+
     run_proof(args)
     return 0
 

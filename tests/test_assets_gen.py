@@ -321,8 +321,12 @@ def test_generate_drum_kit_kebero_request_writes_hand_drum_samples(tmp_path):
 
     kit = generator.generate_drum_kit(['kebero'])
 
-    assert list(kit) == ['kebero_bass', 'kebero_slap']
-    assert _sample_names(kit) == {'kebero_bass.wav', 'kebero_slap.wav'}
+    assert list(kit) == ['kebero_low', 'kebero_high', 'kebero_bass', 'kebero_slap']
+    assert _sample_names(kit) == {'kebero_low.wav', 'kebero_high.wav'}
+    assert kit['kebero_bass'] == kit['kebero_low']
+    assert kit['kebero_slap'] == kit['kebero_high']
+    assert (tmp_path / 'kebero_low.wav').exists()
+    assert (tmp_path / 'kebero_high.wav').exists()
 
 
 def test_texture_instance_wrappers_write_legacy_file_names(tmp_path):

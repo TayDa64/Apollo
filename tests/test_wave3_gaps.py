@@ -167,16 +167,20 @@ class TestDocumentation:
 # ---------------------------------------------------------------------------
 
 class TestOrchestratorState:
-    """Verify orchestration.json updates."""
+    """Verify orchestration.json updates when local state file is present."""
 
     def test_builder_4_completed(self):
         orch_path = Path(__file__).parent.parent / ".github" / "state" / "orchestration.json"
+        if not orch_path.exists():
+            pytest.skip("mutable .github/state/orchestration.json is gitignored")
         data = json.loads(orch_path.read_text(encoding="utf-8"))
         b4 = data.get("architecture_refactoring", {}).get("builder_4_instrument_plugin_system", {})
         assert b4.get("status") == "completed"
 
     def test_wave_3_section_exists(self):
         orch_path = Path(__file__).parent.parent / ".github" / "state" / "orchestration.json"
+        if not orch_path.exists():
+            pytest.skip("mutable .github/state/orchestration.json is gitignored")
         data = json.loads(orch_path.read_text(encoding="utf-8"))
         assert "wave_3" in data, "wave_3 section missing from orchestration.json"
         assert data["wave_3"]["status"] == "COMPLETE"

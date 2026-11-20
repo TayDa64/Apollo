@@ -74,6 +74,12 @@ Examples:
         help="Start JSON-RPC server instead of OSC server (default port 8765)"
     )
     parser.add_argument(
+        "--jsonrpc-port",
+        type=int,
+        default=8765,
+        help="TCP port for JSON-RPC server in --gateway mode (default: 8765)"
+    )
+    parser.add_argument(
         "--gateway",
         action="store_true",
         help="Start dual-protocol gateway (OSC + JSON-RPC)"
@@ -84,7 +90,7 @@ Examples:
     if args.gateway:
         from .gateway import run_gateway
 
-        jsonrpc_port = args.port if args.port != 9000 else 8765
+        jsonrpc_port = args.jsonrpc_port
 
         # Use ASCII-only output to avoid Windows console encoding crashes when embedded.
         print("Starting AI Music Generator Gateway (OSC + JSON-RPC)")

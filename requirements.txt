@@ -1,44 +1,54 @@
-# Multimodal AI Music Generator - Requirements
-# Target: Python 3.12+, CPU-only operation
+# Multimodal AI Music Generator (MUSE) — Deterministic Requirements
+# Target: Python 3.12 / 3.13 (.venv), CPU-first operation
+#
+# Quick deterministic setup (Windows PowerShell):
+#   py -3.13 -m venv .venv
+#   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# Core MIDI Libraries
-mido>=1.3.0                    # MIDI file I/O and message handling
-pretty_midi>=0.2.10            # High-level MIDI manipulation
+# -----------------------------------------------------------------------------
+# Core MIDI & Schema Contracts
+# -----------------------------------------------------------------------------
+mido>=1.3.0,<2.0.0             # MIDI file I/O and message handling
+pydantic>=2.0.0,<3.0.0         # Strict schema validation (MPC, ScorePlan, NeuralIO)
+jsonschema>=4.20.0,<5.0.0      # Draft-07 JSON Schema validation (score_plan.v1)
+PyYAML>=6.0.0,<7.0.0           # Arrangement templates & preset YAML loading
 
-# Live MIDI device backend (pygame has pre-built Windows wheels, no compilation needed)
-pygame>=2.0.0
+# -----------------------------------------------------------------------------
+# Audio Processing & Synthesis (CPU)
+# -----------------------------------------------------------------------------
+numpy>=1.24.0,<3.0.0           # Numerical operations for procedural audio synthesis
+scipy>=1.11.0,<2.0.0           # Signal processing (filters, envelopes, resampling)
+soundfile>=0.12.0,<1.0.0       # WAV/FLAC audio file I/O
 
-# Audio Processing & Synthesis
-numpy>=1.24.0                  # Numerical operations for audio synthesis
-scipy>=1.11.0                  # Signal processing (filters, envelopes)
-soundfile>=0.12.0              # WAV/FLAC audio file I/O
+# -----------------------------------------------------------------------------
+# Reference Audio Analysis (for --reference and /analyze URL/audio)
+# -----------------------------------------------------------------------------
+librosa>=0.10.0,<1.0.0         # Audio analysis (BPM, key, spectral descriptors)
+yt-dlp>=2024.1.0               # Reference URL audio download
 
-# Reference Analysis (for --reference feature)
-librosa>=0.10.0                # Audio analysis (BPM, key, spectral features)
-yt-dlp>=2024.1.0               # YouTube audio download
+# -----------------------------------------------------------------------------
+# Live MIDI & Server Communication (JUCE <-> Python OSC / JSON-RPC)
+# -----------------------------------------------------------------------------
+pygame>=2.0.0,<3.0.0           # Live MIDI device backend (pre-built Windows wheels)
+python-osc>=1.8.0,<2.0.0       # OSC protocol for JUCE <-> Python communication
+colorama>=0.4.6,<1.0.0         # Cross-platform CLI terminal colors
 
-# Optional: MIDI-to-Audio rendering (requires FluidSynth installed)
-midi2audio>=0.1.1              # FluidSynth Python wrapper
+# -----------------------------------------------------------------------------
+# Development, Typechecking & Testing
+# -----------------------------------------------------------------------------
+pytest>=7.4.0,<10.0.0          # Unit & contract test framework
+pytest-cov>=4.1.0,<8.0.0       # Coverage reporting
+pyright>=1.1.390               # Static type checking (runs inside .venv)
 
-# XML Processing (for MPC export)
-lxml>=4.9.0                    # Fast XML parsing/generation (preferred)
-# Note: xml.etree is stdlib fallback
-
-# CLI & UX
-tqdm>=4.65.0                   # Progress bars for batch processing
-colorama>=0.4.6                # Cross-platform terminal colors
-
-# Data Validation
-pydantic>=2.0.0                # Schema validation for MPC export
-
-# Server & Communication (for JUCE integration)
-python-osc>=1.8.0              # OSC protocol for JUCE ↔ Python communication
-
-# Development & Testing
-pytest>=7.4.0                  # Unit testing framework
-pytest-cov>=4.1.0              # Coverage reporting
-
-# Optional: Advanced Audio (stretch goal - requires GPU or is slow on CPU)
-# torch>=2.0.0                 # For MusicGen inference (optional)
-# transformers>=4.30.0         # Hugging Face models (optional)
-# audiocraft>=1.0.0            # Meta's MusicGen (optional, GPU recommended)
+# -----------------------------------------------------------------------------
+# Optional Capabilities (install only when needed; never required for Colab kit)
+# -----------------------------------------------------------------------------
+# python-rtmidi>=1.5.0         # Virtual MIDI bridge (loopMIDI -> MPC Beats)
+# onnxruntime>=1.17.0          # Embedding search acceleration
+# llama-cpp-python>=0.3.0      # Local GGUF neural backend (e.g., Gemma 4 local)
+# torch>=2.0.0                 # Neural audio rendering / stem separation
+# demucs>=4.0.0                # Stem separation backend (optional)
+# Note: FluidSynth is an external OS binary (not a Python package).
+#       See assets/soundfonts/README.md and run:
+#       python scripts/fluidsynth_env_proof.py --check-only

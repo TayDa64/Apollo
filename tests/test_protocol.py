@@ -1039,5 +1039,175 @@ class TestTakeRenderBackend:
         assert captured["track_names"] == ["Meta", "Pad", "Drums_Take_1", "Bass_Take_1"]
 
 
+class TestPhase1ProtocolDriftFixes:
+    """Regression tests for Phase 1 OSC / JSON-RPC / Gateway drift remediation."""
+
+    def test_schema_version_validation_rejects_newer_client_with_103(self):
+        server = _create_test_osc_server()
+
+        assert server._validate_schema_version(SCHEMA_VERSION, request_id="ok-1") is True
+        assert server._validate_schema_version(0, request_id="old-1") is True
+        assert server._validate_schema_version(SCHEMA_VERSION + 1, request_id="new-1") is False
+
+        errors = _sent_payloads(server, OSCAddresses.ERROR)
+        assert len(errors) == 1
+        assert errors[0]["code"] == ErrorCode.SCHEMA_VERSION_MISMATCH
+        assert errors[0]["request_id"] == "new-1"
+        assert errors[0]["schema_version"] == SCHEMA_VERSION
+
+    def test_controls_set_and_clear_accept_orchestral_stage_preset_without_type_error(self):
+        server = _create_test_osc_server()
+
+        server._handle_controls_set(
+            OSCAddresses.CONTROLS_SET,
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": "ctrl-1",
+                    "overrides": {
+                        "orchestral_stage_preset": "epic",
+                        "tension_intensity": 0.75,
+                    },
+                }
+            ),
+        )
+        statuses = _sent_payloads(server, OSCAddresses.STATUS)
+        assert len(statuses) == 1
+        assert statuses[0]["status"] == "controls_updated"
+        assert statuses[0]["request_id"] == "ctrl-1"
+        assert statuses[0]["overrides"]["orchestral_stage_preset"] == "epic"
+
+        server._send_message.reset_mock()
+        server._handle_controls_clear(
+            OSCAddresses.CONTROLS_CLEAR,
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": "ctrl-2",
+                    "keys": ["orchestral_stage_preset"],
+                }
+            ),
+        )
+        statuses = _sent_payloads(server, OSCAddresses.STATUS)
+        assert len(statuses) == 1
+        assert statuses[0]["status"] == "controls_cleared"
+        assert statuses[0]["cleared"] == ["orchestral_stage_preset"]
+        assert "orchestral_stage_preset" not in server._control_overrides
+
+    def test_regenerate_uses_scale_type_and_sends_regenerating_status(self):
+        server = _create_test_osc_server()
+        fake_worker = MagicMock()
+        fake_worker.is_busy.return_value = False
+        fake_worker.submit.return_value = "task-regen-1"
+        server._gen_worker = fake_worker
+
+        server._handle_regenerate(
+            OSCAddresses.REGENERATE,
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": "regen-1",
+                    "start_bar": 4,
+                    "end_bar": 8,
+                    "tracks": ["drums"],
+                    "prompt": "92 BPM G-Funk in A minor",
+                    "options": {"bpm": 92, "key": "A", "mode": "minor", "genre": "g_funk"},
+                }
+            ),
+        )
+
+        errors = _sent_payloads(server, OSCAddresses.ERROR)
+        statuses = _sent_payloads(server, OSCAddresses.STATUS)
+        assert errors == []
+        assert len(statuses) == 1
+        assert statuses[0]["status"] == "regeneration_started"
+        assert statuses[0]["request_id"] == "regen-1"
+        assert fake_worker.submit.called
+
+    def test_analyze_accepts_legacy_file_path_alias(self, tmp_path):
+        server = _create_test_osc_server()
+        # Create minimal valid MIDI file for offline file_analysis routing
+        midi_path = _write_take_render_midi(tmp_path)
+
+        server._handle_analyze(
+            OSCAddresses.ANALYZE,
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "request_id": "analyze-alias-1",
+                    "file_path": str(midi_path),
+                }
+            ),
+        )
+
+        errors = _sent_payloads(server, OSCAddresses.ERROR)
+        results = _sent_payloads(server, OSCAddresses.ANALYZE_RESULT)
+        assert errors == []
+        assert len(results) == 1
+        assert results[0]["request_id"] == "analyze-alias-1"
+        assert results[0]["success"] is True
+
+    def test_jsonrpc_run_critics_supports_inline_features_and_threading_server(self):
+        from http.server import ThreadingHTTPServer
+        from multimodal_gen.server import jsonrpc_server as jrpc_mod
+
+        server = jrpc_mod.MusicGenJSONRPCServer(port=0)
+        assert issubclass(jrpc_mod.ThreadingHTTPServer, ThreadingHTTPServer)
+
+        # Inline features without midi_path must succeed (no longer rejected)
+        resp = server._handle_run_critics(
+            {
+                "voicings": [[60, 64, 67], [62, 65, 69], [64, 67, 71]],
+                "bass_notes": [{"tick": 0, "pitch": 48}, {"tick": 480, "pitch": 48}, {"tick": 960, "pitch": 50}],
+                "kick_ticks": [0, 480, 960],
+                "tension_curve": [0.2, 0.5, 0.8],
+                "note_density_per_beat": [1.0, 2.0, 3.0],
+            }
+        )
+        assert "overall_passed" in resp
+        assert "metrics" in resp
+        assert len(resp["metrics"]) >= 1
+
+        # GenerationRequest bars alias and defaults
+        req = server._build_generation_request({"prompt": "lofi beat", "bars": 12})
+        assert req.duration_bars == 12
+
+    def test_gateway_isolates_jsonrpc_callbacks_from_osc(self):
+        from multimodal_gen.server import gateway as gw_mod
+        from multimodal_gen.server import jsonrpc_server as jrpc_mod
+
+        gw = gw_mod.GatewayServer(osc_recv_port=0, osc_send_port=0, jsonrpc_port=0)
+        osc_srv = _create_test_osc_server()
+        json_srv = jrpc_mod.MusicGenJSONRPCServer(port=0)
+        fake_worker = MagicMock()
+        gw._osc_server = osc_srv
+        gw._json_server = json_srv
+        gw._worker = fake_worker
+
+        # Mark task as owned by JSON-RPC (tracked in json_srv._progress)
+        json_srv._progress["task-jrpc-1"] = {"status": "queued"}
+        fake_worker.get_current_task_id.return_value = "task-jrpc-1"
+        gw._dispatch_progress("parsing", 0.1, "Parsing...")
+        gw._dispatch_complete(
+            GenerationResult(
+                task_id="task-jrpc-1",
+                request_id="req-jrpc-1",
+                success=True,
+                midi_path="/tmp/a.mid",
+            )
+        )
+        # OSC must NOT receive unsolicited messages for JSON-RPC tasks
+        assert osc_srv._send_message.call_count == 0
+        # JSON-RPC cache SHOULD receive it
+        assert "task-jrpc-1" in json_srv._results
+
+        # Mark task as owned by OSC (tracked in osc_srv._owned_task_ids)
+        osc_srv._owned_task_ids.add("task-osc-1")
+        fake_worker.get_current_task_id.return_value = "task-osc-1"
+        gw._dispatch_progress("parsing", 0.2, "Parsing OSC...")
+        assert osc_srv._send_message.call_count == 1
+        assert "task-osc-1" not in json_srv._progress
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
