@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muse-colab-kit"
+version = "0.1.0"
+description = "Standalone pure-Python schemas, deterministic GRPO verifiers, and local dataset exporter for MUSE"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.0.0",
+  "mido>=1.3.0",
+  "PyYAML>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0"]
+jsonschema = ["jsonschema>=4.20.0"]
+
+[project.scripts]
+muse-colab-export = "muse_colab_kit.dataset_export:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"muse_colab_kit.schemas" = ["data/*.json"]
