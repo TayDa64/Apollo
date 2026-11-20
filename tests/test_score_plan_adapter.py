@@ -1,9 +1,13 @@
+import pytest
+
 from multimodal_gen.score_plan_adapter import (
+    ScorePlanError,
     extract_mastering_overrides,
     score_plan_to_parsed_prompt,
     score_plan_to_performance_score,
+    validate_score_plan,
 )
-from multimodal_gen.utils import bars_to_ticks
+from multimodal_gen.utils import ScaleType, bars_to_ticks
 
 
 def _sample_plan():
@@ -92,3 +96,48 @@ def test_extract_mastering_overrides_returns_structured_block():
     assert mastering["production_preset"] == "ambient_ethereal"
     assert mastering["target_lufs"] == -16.0
     assert mastering["master_ceiling_db"] == -1.5
+
+
+@pytest.mark.parametrize(
+    "mode_str,expected",
+    [
+        ("major", ScaleType.MAJOR),
+        ("minor", ScaleType.MINOR),
+        ("dorian", ScaleType.DORIAN),
+        ("phrygian", ScaleType.PHRYGIAN),
+        ("lydian", ScaleType.LYDIAN),
+        ("mixolydian", ScaleType.MIXOLYDIAN),
+        ("locrian", ScaleType.LOCRIAN),
+    ],
+)
+def test_score_plan_preserves_all_seven_modes(mode_str, expected):
+    plan = _sample_plan()
+    plan["mode"] = mode_str
+    parsed = score_plan_to_parsed_prompt(plan)
+    assert parsed.scale_type == expected
+
+
+def test_validate_score_plan_rejects_extra_fields_and_invalid_bpm():
+    bad_extra = _sample_plan()
+    bad_extra["unexpected_key"] = 123
+    with pytest.raises(ScorePlanError):
+        validate_score_plan(bad_extra)
+
+    bad_bpm = _sample_plan()
+    bad_bpm["bpm"] = 999
+    with pytest.raises(ScorePlanError):
+        validate_score_plan(bad_bpm)
+
+
+def test_score_plan_applies_section_energy_and_tension():
+    plan = _sample_plan()
+    plan["sections"] = [
+        {"name": "intro", "type": "intro", "bars": 4, "energy": 0.22, "tension": 0.15},
+        {"name": "drop", "type": "drop", "bars": 8, "energy": 0.94, "tension": 0.88},
+    ]
+    score = score_plan_to_performance_score(plan)
+    assert len(score.sections) == 2
+    assert score.sections[0].config.energy_level == pytest.approx(0.22)
+    assert score.sections[1].config.energy_level == pytest.approx(0.94)
+    assert score.tension_curve == [0.15, 0.88]
+

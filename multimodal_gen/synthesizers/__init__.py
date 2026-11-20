@@ -29,7 +29,26 @@ from .base import (
 )
 from .factory import SynthesizerFactory
 from .fluidsynth_synth import FluidSynthSynthesizer
-from .neural_runtime import NeuralBackendStatus, NeuralRenderResult, OptionalNeuralRuntime
+from .neural_runtime import (
+    NEURAL_CONTRACT_VERSION,
+    AudioConditioningRef,
+    InstrumentPatchV1,
+    LocalGGUFNeuralAdapter,
+    NeuralAudioRenderRequest,
+    NeuralAudioRenderResponse,
+    NeuralBackendConfig,
+    NeuralBackendStatus,
+    NeuralGenerationRequest,
+    NeuralGenerationResponse,
+    NeuralRenderResult,
+    NeuralRuntimeContractV1,
+    NeuralRuntimeProtocol,
+    OptionalNeuralRuntime,
+    RemoteOpenAICompatibleNeuralAdapter,
+    ScorePlanV1,
+    create_neural_runtime,
+    export_neural_runtime_json_schema,
+)
 from .procedural_synth import ProceduralSynthesizer
 from .plugin_synth import PluginSynthesizer
 
@@ -43,9 +62,24 @@ __all__ = [
     'SynthesizerFactory',
     # Implementations
     'FluidSynthSynthesizer',
+    'NEURAL_CONTRACT_VERSION',
+    'AudioConditioningRef',
+    'InstrumentPatchV1',
+    'LocalGGUFNeuralAdapter',
+    'NeuralAudioRenderRequest',
+    'NeuralAudioRenderResponse',
+    'NeuralBackendConfig',
     'NeuralBackendStatus',
+    'NeuralGenerationRequest',
+    'NeuralGenerationResponse',
     'NeuralRenderResult',
+    'NeuralRuntimeContractV1',
+    'NeuralRuntimeProtocol',
     'OptionalNeuralRuntime',
+    'RemoteOpenAICompatibleNeuralAdapter',
+    'ScorePlanV1',
+    'create_neural_runtime',
+    'export_neural_runtime_json_schema',
     'ProceduralSynthesizer',
     'PluginSynthesizer',
 ]

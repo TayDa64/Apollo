@@ -268,7 +268,7 @@ class Clip:
         return len(self.take_lanes) > 1
     
     def add_take(self, seed: int, variation_type: str = "default",
-                 parameters: Dict[str, Any] = None) -> TakeMetadata:
+                 parameters: Optional[Dict[str, Any]] = None) -> TakeMetadata:
         """Add a new take to this clip (legacy method)."""
         take = TakeMetadata(
             take_id=len(self.takes),
@@ -289,7 +289,7 @@ class Clip:
         notes_added: int = 0,
         notes_modified: int = 0,
         avg_timing_shift: float = 0.0,
-        parameters: Dict[str, Any] = None,
+        parameters: Optional[Dict[str, Any]] = None,
     ) -> TakeLaneRef:
         """Add a TakeLane reference to this clip.
         
@@ -348,9 +348,10 @@ class Clip:
     
     @classmethod
     def from_dict(cls, data: Dict) -> "Clip":
-        takes_data = data.pop("takes", [])
-        take_lanes_data = data.pop("take_lanes", [])
-        clip = cls(**{k: v for k, v in data.items() 
+        payload = dict(data)
+        takes_data = payload.pop("takes", [])
+        take_lanes_data = payload.pop("take_lanes", [])
+        clip = cls(**{k: v for k, v in payload.items()
                       if k not in ("takes", "take_lanes")})
         clip.takes = [TakeMetadata.from_dict(t) for t in takes_data]
         clip.take_lanes = [TakeLaneRef.from_dict(tl) for tl in take_lanes_data]
@@ -425,8 +426,9 @@ class ConstraintSet:
     
     @classmethod
     def from_dict(cls, data: Dict) -> "ConstraintSet":
-        constraints_data = data.pop("constraints", [])
-        cs = cls(**data)
+        payload = dict(data)
+        constraints_data = payload.pop("constraints", [])
+        cs = cls(**payload)
         cs.constraints = [Constraint.from_dict(c) for c in constraints_data]
         return cs
 
@@ -489,7 +491,7 @@ class Track:
     color: str = "#808080"
     
     def add_clip(self, start_tick: int, end_tick: int, clip_type: str = "midi",
-                 seed: int = None) -> Clip:
+                 seed: Optional[int] = None) -> Clip:
         """Add a new clip to this track."""
         clip_id = f"{self.track_id}_clip_{len(self.clips)}"
         clip = Clip(
@@ -520,12 +522,13 @@ class Track:
     
     @classmethod
     def from_dict(cls, data: Dict) -> "Track":
-        clips_data = data.pop("clips", [])
-        instrument_data = data.pop("instrument", None)
-        mix_data = data.pop("mix", {})
-        constraints_data = data.pop("constraints", None)
+        payload = dict(data)
+        clips_data = payload.pop("clips", [])
+        instrument_data = payload.pop("instrument", None)
+        mix_data = payload.pop("mix", {})
+        constraints_data = payload.pop("constraints", None)
         
-        track = cls(**{k: v for k, v in data.items() 
+        track = cls(**{k: v for k, v in payload.items()
                        if k not in ("clips", "instrument", "mix", "constraints")})
         track.clips = [Clip.from_dict(c) for c in clips_data]
         track.instrument = InstrumentSelection.from_dict(instrument_data) if instrument_data else None
@@ -786,7 +789,8 @@ class SessionGraph:
         return None
     
     def log_decision(self, decision_type: str, description: str,
-                     before: str = None, after: str = None, reason: str = "") -> None:
+                     before: Optional[str] = None, after: Optional[str] = None,
+                     reason: str = "") -> None:
         """Log a generation decision for explainability."""
         entry = GenerationHistory(
             timestamp=datetime.now().isoformat(),
@@ -868,24 +872,25 @@ class SessionGraph:
     
     @classmethod
     def from_dict(cls, data: Dict) -> "SessionGraph":
-        """Deserialize from dictionary."""
+        """Deserialize from dictionary without mutating caller input."""
+        payload = dict(data)
         # Extract nested structures
-        global_constraints_data = data.pop("global_constraints", None)
-        sections_data = data.pop("sections", [])
-        tracks_data = data.pop("tracks", [])
-        groove_data = data.pop("groove_template", None)
-        render_data = data.pop("render_directive", {})
-        history_data = data.pop("history", [])
-        genre_dna_data = data.pop("genre_dna", None)
-        progression_data = data.pop("progression", [])
-        preferences_data = data.pop("preferences", None)
-        compression_version_data = data.pop("compression_version", "1.0.0")
-        time_sig = data.pop("time_signature", [4, 4])
+        global_constraints_data = payload.pop("global_constraints", None)
+        sections_data = payload.pop("sections", [])
+        tracks_data = payload.pop("tracks", [])
+        groove_data = payload.pop("groove_template", None)
+        render_data = payload.pop("render_directive", {})
+        history_data = payload.pop("history", [])
+        genre_dna_data = payload.pop("genre_dna", None)
+        progression_data = payload.pop("progression", [])
+        preferences_data = payload.pop("preferences", None)
+        compression_version_data = payload.pop("compression_version", "1.0.0")
+        time_sig = payload.pop("time_signature", [4, 4])
         
         # Create base object
-        graph = cls(**{k: v for k, v in data.items() 
-                       if k not in ("global_constraints", "sections", "tracks", 
-                                    "groove_template", "render_directive", 
+        graph = cls(**{k: v for k, v in payload.items()
+                       if k not in ("global_constraints", "sections", "tracks",
+                                    "groove_template", "render_directive",
                                     "history", "time_signature")})
         
         # Restore nested structures
@@ -902,6 +907,40 @@ class SessionGraph:
         graph.compression_version = compression_version_data
         
         return graph
+
+    def to_neural_context(self) -> Dict[str, Any]:
+        """Return a bounded JSON-serializable context dict for ``NeuralGenerationRequest``."""
+        forbidden = [c.element for c in self.global_constraints.get_forbidden()] if self.global_constraints else []
+        mandatory = [c.element for c in self.global_constraints.get_mandatory()] if self.global_constraints else []
+        return {
+            "session_id": self.session_id,
+            "bpm": float(self.bpm),
+            "key": self.key,
+            "scale": self.scale,
+            "genre": self.genre,
+            "time_signature": [int(self.time_signature[0]), int(self.time_signature[1])],
+            "total_bars": int(self.total_bars),
+            "sections": [
+                {
+                    "name": s.name,
+                    "type": s.section_type,
+                    "bars": int(s.bars),
+                    "energy": round(float(s.energy_level), 3),
+                }
+                for s in self.sections
+            ],
+            "tracks": [
+                {
+                    "name": t.name,
+                    "role": t.role,
+                    "instrument": t.instrument.name if t.instrument else "",
+                }
+                for t in self.tracks
+            ],
+            "forbidden_elements": forbidden,
+            "mandatory_elements": mandatory,
+            "genre_dna": dict(self.genre_dna) if isinstance(self.genre_dna, dict) else None,
+        }
     
     def save_manifest(self, path: str) -> None:
         """Save session manifest to JSON file."""
@@ -1161,7 +1200,7 @@ class SessionGraphBuilder:
             graph.groove_template = GrooveTemplate(
                 name="reference_groove",
                 swing_amount=ref.groove.swing_amount,
-                extracted_from=getattr(ref, 'source_url', 'reference'),
+                source=str(getattr(ref, 'source_url', 'reference') or 'reference'),
             )
         
         return graph
@@ -1848,15 +1887,15 @@ if __name__ == "__main__":
         key: str = "C"
         scale_type: str = "minor"
         genre: str = "trap_soul"
-        instruments: list = None
+        instruments: Optional[List[str]] = None
         mood: str = "dark"
         energy: str = "medium"
         use_sidechain: bool = True
         use_swing: bool = False
         swing_amount: float = 0.0
-        textures: list = None
-        excluded_drums: list = None
-        excluded_instruments: list = None
+        textures: Optional[List[str]] = None
+        excluded_drums: Optional[List[str]] = None
+        excluded_instruments: Optional[List[str]] = None
         humanization_profile: str = "natural"
         
         def __post_init__(self):

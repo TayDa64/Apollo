@@ -7,46 +7,60 @@ without changing core generation behavior.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import ValidationError
 
 from .prompt_parser import PromptParser, ParsedPrompt
 from .utils import bars_to_ticks, ScaleType
 from .arranger import SectionType, SectionConfig, SECTION_CONFIGS, SongSection
 from .agents.context import PerformanceScore
+from .synthesizers.neural_runtime import ScorePlanV1
 
 
 SCORE_PLAN_SCHEMA_PATH = Path(__file__).parent.parent / "docs" / "muse-specs" / "schemas" / "score_plan.v1.schema.json"
+
+_MODE_TO_SCALE_TYPE: Dict[str, ScaleType] = {
+    "major": ScaleType.MAJOR,
+    "minor": ScaleType.MINOR,
+    "dorian": ScaleType.DORIAN,
+    "phrygian": ScaleType.PHRYGIAN,
+    "lydian": ScaleType.LYDIAN,
+    "mixolydian": ScaleType.MIXOLYDIAN,
+    "locrian": ScaleType.LOCRIAN,
+}
 
 
 class ScorePlanError(ValueError):
     """Raised when a score plan is invalid or cannot be adapted."""
 
 
-def validate_score_plan(plan: Dict[str, Any], schema_path: Optional[Path] = None) -> None:
-    """Validate a score plan against the JSON schema when available."""
+def validate_score_plan(plan: Dict[str, Any], schema_path: Optional[Path] = None) -> ScorePlanV1:
+    """Validate a score plan strictly via frozen Pydantic ``ScorePlanV1`` (and optional JSON schema)."""
     if not isinstance(plan, dict):
         raise ScorePlanError("Score plan must be a dict")
 
-    schema_file = schema_path or SCORE_PLAN_SCHEMA_PATH
     try:
-        import json
-        import jsonschema  # type: ignore
+        validated = ScorePlanV1.model_validate(plan)
+    except ValidationError as exc:
+        raise ScorePlanError(f"Score plan validation failed: {exc}") from exc
 
-        schema = json.loads(schema_file.read_text(encoding="utf-8"))
-        jsonschema.validate(plan, schema)
-        return
-    except ImportError:
-        # Minimal validation when jsonschema is unavailable.
-        required = ("schema_version", "prompt", "bpm", "key", "mode", "sections", "tracks")
-        missing = [k for k in required if k not in plan]
-        if missing:
-            raise ScorePlanError(f"Score plan missing required fields: {', '.join(missing)}")
-    except FileNotFoundError as e:
-        raise ScorePlanError(f"Score plan schema not found: {e}") from e
-    except Exception as e:
-        raise ScorePlanError(f"Score plan validation failed: {e}") from e
+    if schema_path is not None:
+        try:
+            import json
+            import jsonschema  # type: ignore
+
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            jsonschema.validate(plan, schema)
+        except ImportError:
+            pass
+        except FileNotFoundError as e:
+            raise ScorePlanError(f"Score plan schema not found: {e}") from e
+        except Exception as e:
+            raise ScorePlanError(f"Score plan validation failed: {e}") from e
+
+    return validated
 
 
 def score_plan_to_parsed_prompt(plan: Dict[str, Any], parser: Optional[PromptParser] = None) -> ParsedPrompt:
@@ -60,7 +74,7 @@ def score_plan_to_parsed_prompt(plan: Dict[str, Any], parser: Optional[PromptPar
     key = str(plan.get("key", parsed.key or "C")).strip()
     mode = str(plan.get("mode", "minor")).strip().lower()
     parsed.key = key
-    parsed.scale_type = ScaleType.MINOR if mode != "major" else ScaleType.MAJOR
+    parsed.scale_type = _MODE_TO_SCALE_TYPE.get(mode, ScaleType.MINOR)
 
     if plan.get("time_signature"):
         try:
@@ -146,6 +160,17 @@ def build_sections_from_plan(
         base_config: SectionConfig = SECTION_CONFIGS.get(section_type, SectionConfig())
         config = SectionConfig(**base_config.__dict__)
 
+        if entry.get("energy") is not None:
+            energy = max(0.0, min(1.0, float(entry["energy"])))
+            config.energy_level = energy
+        if entry.get("tension") is not None:
+            tension = max(0.0, min(1.0, float(entry["tension"])))
+            # Blend filter brightness and rhythmic/melodic density toward tension
+            config.filter_cutoff = max(0.15, min(1.0, 0.5 * config.filter_cutoff + 0.5 * tension))
+            config.instrument_density = max(
+                0.1, min(1.0, 0.5 * config.instrument_density + 0.5 * tension)
+            )
+
         section = SongSection(
             section_type=section_type,
             start_tick=current_tick,
@@ -207,12 +232,20 @@ def score_plan_to_performance_score(plan: Dict[str, Any]) -> PerformanceScore:
         except Exception:
             continue
 
-    # Tension curve (optional)
+    # Tension curve (optional; falls back to per-section tensions when supplied)
     if plan.get("tension_curve"):
         try:
             score.tension_curve = [float(v) for v in plan["tension_curve"]]
         except Exception:
             pass
+    else:
+        section_tensions = [
+            float(entry["tension"])
+            for entry in plan.get("sections", [])
+            if isinstance(entry, dict) and entry.get("tension") is not None
+        ]
+        if section_tensions:
+            score.tension_curve = section_tensions
 
     return score
 

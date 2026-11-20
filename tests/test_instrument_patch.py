@@ -1,9 +1,15 @@
 """Focused regressions for the bounded InstrumentPatch backend registry."""
 
+import pytest
+from pydantic import ValidationError
+
 from multimodal_gen.instrument_patch import (
     build_track_scoped_instrument_patches,
     enrich_instrument_patches_with_resolved_samples,
+    get_instrument_patch,
+    get_registered_patch_families,
     normalize_instrument_alias,
+    validate_instrument_patch,
 )
 
 
@@ -110,3 +116,19 @@ def test_enrich_instrument_patches_leaves_ambiguous_matches_empty(tmp_path):
     )
 
     assert enriched[0].sample_layers == []
+
+
+def test_validate_instrument_patch_accepts_all_families_and_rejects_extra_fields():
+    for family in get_registered_patch_families():
+        patch = get_instrument_patch(family)
+        assert patch is not None
+        validated = validate_instrument_patch(patch)
+        assert validated.patch_id == patch.patch_id
+
+    bad = get_instrument_patch("guitar")
+    assert bad is not None
+    bad_dict = bad.to_dict()
+    bad_dict["unknown_extra_key"] = True
+    with pytest.raises(ValidationError):
+        validate_instrument_patch(bad_dict)
+

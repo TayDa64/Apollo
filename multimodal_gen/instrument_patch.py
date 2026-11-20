@@ -11,15 +11,17 @@ from __future__ import annotations
 import copy
 import re
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
-from typing import Iterable, Literal, Optional
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Iterable, Literal, Optional, Union, cast
 
 
 class SerializableDataclass:
     """Mixin for dataclass serialization."""
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    def to_dict(self) -> dict[str, Any]:
+        if not is_dataclass(self):
+            raise TypeError(f"{type(self).__name__} must be a dataclass")
+        return asdict(cast(Any, self))
 
 
 @dataclass
@@ -1013,6 +1015,14 @@ def enrich_instrument_patches_with_resolved_samples(
     return enriched
 
 
+def validate_instrument_patch(patch: Union[InstrumentPatch, dict[str, Any]]):
+    """Validate an ``InstrumentPatch`` instance or dict against frozen ``InstrumentPatchV1``."""
+    from .synthesizers.neural_runtime import InstrumentPatchV1
+
+    payload = patch.to_dict() if isinstance(patch, InstrumentPatch) else patch
+    return InstrumentPatchV1.model_validate(payload)
+
+
 __all__ = [
     "EnvelopeSpec",
     "VelocityMap",
@@ -1032,4 +1042,5 @@ __all__ = [
     "get_instrument_patch",
     "build_track_scoped_instrument_patches",
     "enrich_instrument_patches_with_resolved_samples",
+    "validate_instrument_patch",
 ]
