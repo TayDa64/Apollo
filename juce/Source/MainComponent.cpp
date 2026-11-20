@@ -1,0 +1,4270 @@
+/*
+  ==============================================================================
+
+    MainComponent.cpp
+    
+    Implementation of the root UI component.
+
+  ==============================================================================
+*/
+
+#include "MainComponent.h"
+#include "UI/Theme/ColourScheme.h"
+#include "UI/Theme/LayoutConstants.h"
+
+#include <algorithm>
+#include <map>
+#include <set>
+#include <thread>
+#include <vector>
+
+namespace
+{
+constexpr const char* kSampleInstrumentPrefix = "sample:";
+constexpr const char* kGenerateLogName = "juce_generate.log";
+
+bool isSampleInstrumentId(const juce::String& instrumentId)
+{
+    return instrumentId.startsWithIgnoreCase(kSampleInstrumentPrefix);
+}
+
+bool isDefaultSynthInstrumentId(const juce::String& instrumentId)
+{
+    return instrumentId.isEmpty() || instrumentId == "default_sine";
+}
+
+bool isGeneratedMidiProgramInstrumentId(const juce::String& instrumentId)
+{
+    return instrumentId.startsWithIgnoreCase("gm_program:");
+}
+
+juce::File sampleFileFromInstrumentId(const juce::String& instrumentId)
+{
+    auto path = instrumentId.fromFirstOccurrenceOf(kSampleInstrumentPrefix, false, false).trim();
+    return juce::File(path);
+}
+
+juce::var parseInstrumentCatalogPayload(const juce::String& json)
+{
+    auto parsedJSON = juce::JSON::parse(json);
+    if (parsedJSON.isVoid())
+        return {};
+
+    // Backend may send a compact OSC payload plus a manifest file to avoid size limits.
+    auto manifestVar = parsedJSON.getProperty("manifest_path", juce::var());
+    if (manifestVar.isString())
+    {
+        juce::File manifestFile(manifestVar.toString());
+        if (manifestFile.existsAsFile())
+        {
+            auto manifestJSON = juce::JSON::parse(manifestFile.loadFileAsString());
+            if (!manifestJSON.isVoid())
+                parsedJSON = manifestJSON;
+        }
+    }
+
+    return parsedJSON;
+}
+
+int libraryDropdownCategoryRank(const juce::String& category)
+{
+    const auto label = category.fromLastOccurrenceOf("·", false, false).trim().toLowerCase();
+
+    if (label == "bass") return 0;
+    if (label == "keys") return 1;
+    if (label == "guitar") return 2;
+    if (label == "strings") return 3;
+    if (label == "brass") return 4;
+    if (label == "drums") return 5;
+    if (label == "fx") return 6;
+    if (label == "synth") return 7;
+    if (label == "pad") return 8;
+    return 9;
+}
+
+bool stripLeadingDisplayToken(juce::String& displayName, const juce::String& token)
+{
+    auto trimmed = displayName.trim();
+    if (!trimmed.startsWithIgnoreCase(token) || trimmed.length() <= token.length())
+        return false;
+
+    const auto separator = trimmed[token.length()];
+    if (separator != '-' && separator != '_' && separator != ' ')
+        return false;
+
+    displayName = trimmed.substring(token.length() + 1).trim();
+    return true;
+}
+
+juce::String libraryDropdownCategoryLabel(juce::String category)
+{
+    auto label = category.fromLastOccurrenceOf("·", false, false).trim();
+    if (label.isEmpty())
+        label = category.trim();
+    return label.toLowerCase();
+}
+
+juce::String cleanLibraryDropdownDisplayName(juce::String name, const juce::String& category)
+{
+    const auto originalName = name;
+    auto displayName = name.trim();
+
+    bool strippedSourcePrefix = true;
+    while (strippedSourcePrefix && displayName.isNotEmpty())
+    {
+        strippedSourcePrefix = stripLeadingDisplayToken(displayName, "Inst")
+                               || stripLeadingDisplayToken(displayName, "RnB");
+    }
+
+    const auto label = libraryDropdownCategoryLabel(category);
+    if (label == "bass")
+        stripLeadingDisplayToken(displayName, "Bass");
+    else if (label == "keys")
+        stripLeadingDisplayToken(displayName, "Keys");
+    else if (label == "synth")
+        stripLeadingDisplayToken(displayName, "Synth");
+    else if (label == "pad")
+        stripLeadingDisplayToken(displayName, "Pad");
+    else if (label == "guitar")
+        stripLeadingDisplayToken(displayName, "Guitar");
+    else if (label == "strings")
+        stripLeadingDisplayToken(displayName, "Strings");
+    else if (label == "brass")
+        stripLeadingDisplayToken(displayName, "Brass");
+    else if (label == "fx")
+        stripLeadingDisplayToken(displayName, "FX");
+    else if (label == "drums" || label == "drumkits")
+    {
+        for (const auto& role : { juce::String("Kick"), juce::String("Snare"), juce::String("Hat"), juce::String("Clap") })
+        {
+            if (stripLeadingDisplayToken(displayName, role))
+                break;
+        }
+    }
+
+    return displayName.isNotEmpty() ? displayName : originalName;
+}
+
+juce::String categorizeLibraryInstrument(const InstrumentInfo& info)
+{
+    juce::String text = (info.category + " " + info.subcategory + " " + info.name + " " + info.filename).toLowerCase();
+    if (!info.tags.isEmpty())
+        text << " " << info.tags.joinIntoString(" ").toLowerCase();
+
+    auto hasAny = [&text](std::initializer_list<const char*> terms)
+    {
+        for (const auto* term : terms)
+        {
+            if (text.contains(term))
+                return true;
+        }
+        return false;
+    };
+
+    if (hasAny({ "bass", "808", "sub" })) return "Bass";
+    if (hasAny({ "key", "keys", "piano", "rhodes", "clav", "epiano", "organ", "hammond" })) return "Keys";
+    if (hasAny({ "guitar", "gtr" })) return "Guitar";
+    if (hasAny({ "string", "strings", "violin", "viola", "cello", "ensemble" })) return "Strings";
+    if (hasAny({ "brass", "horn", "trumpet", "trombone", "sax" })) return "Brass";
+    if (hasAny({ "drum", "kick", "snare", "clap", "hat", "hihat", "perc", "percussion", "tom", "cymbal", "rim" })) return "Drums";
+    if (hasAny({ "fx", "sfx", "effect", "riser", "impact", "sweep", "noise", "texture" })) return "FX";
+    if (hasAny({ "pad", "atmos", "choir", "voice", "vocal" })) return "Pad";
+    if (hasAny({ "synth", "lead", "pluck", "arp", "analog" })) return "Synth";
+
+    return "Other";
+}
+
+juce::String libraryDropdownDisplayName(const InstrumentInfo& info, const juce::File& sampleFile, const juce::String& sectionCategory)
+{
+    auto displayName = InstrumentInfo::sanitiseDisplayName(info.name).trim();
+    if (displayName.isEmpty())
+        displayName = InstrumentInfo::sanitiseDisplayName(info.originalName).trim();
+    if (displayName.isEmpty())
+        displayName = InstrumentInfo::sanitiseDisplayName(sampleFile.getFileNameWithoutExtension()).trim();
+    if (displayName.isEmpty())
+        displayName = sampleFile.getFileName();
+
+    return cleanLibraryDropdownDisplayName(displayName, sectionCategory);
+}
+
+std::vector<UI::InstrumentMenuItem> buildLibraryDropdownItemsFromCatalog(const juce::String& json)
+{
+    std::vector<UI::InstrumentMenuItem> items;
+    auto parsedJSON = parseInstrumentCatalogPayload(json);
+    auto* instrumentsObj = parsedJSON.getProperty("instruments", juce::var()).getDynamicObject();
+    if (instrumentsObj == nullptr)
+        return items;
+
+    std::set<std::string> seenIds;
+    std::set<std::string> seenPaths;
+
+    for (const auto& prop : instrumentsObj->getProperties())
+    {
+        auto* arr = prop.value.getArray();
+        if (arr == nullptr)
+            continue;
+
+        for (const auto& instVar : *arr)
+        {
+            auto info = InstrumentInfo::fromJSON(instVar);
+            if (info.category.isEmpty())
+                info.category = prop.name.toString();
+
+            juce::File sampleFile(info.absolutePath);
+            if (!sampleFile.existsAsFile())
+                continue;
+
+            const auto absolutePath = sampleFile.getFullPathName();
+            const auto pathKey = absolutePath.toLowerCase().toStdString();
+            const auto itemId = juce::String(kSampleInstrumentPrefix) + absolutePath;
+            const auto idKey = itemId.toLowerCase().toStdString();
+
+            if (seenPaths.find(pathKey) != seenPaths.end() || seenIds.find(idKey) != seenIds.end())
+                continue;
+
+            seenPaths.insert(pathKey);
+            seenIds.insert(idKey);
+
+            const auto displayCategory = categorizeLibraryInstrument(info);
+
+            UI::InstrumentMenuItem item;
+            item.id = itemId;
+            item.name = libraryDropdownDisplayName(info, sampleFile, displayCategory);
+            item.category = "Library · " + displayCategory;
+            items.push_back(item);
+        }
+    }
+
+    std::sort(items.begin(), items.end(), [](const UI::InstrumentMenuItem& a, const UI::InstrumentMenuItem& b)
+    {
+        const int categoryRankA = libraryDropdownCategoryRank(a.category);
+        const int categoryRankB = libraryDropdownCategoryRank(b.category);
+        if (categoryRankA != categoryRankB)
+            return categoryRankA < categoryRankB;
+
+        const auto categoryA = a.category.toLowerCase();
+        const auto categoryB = b.category.toLowerCase();
+        if (categoryA != categoryB)
+            return categoryA < categoryB;
+
+        const auto nameA = a.name.toLowerCase();
+        const auto nameB = b.name.toLowerCase();
+        if (nameA != nameB)
+            return nameA < nameB;
+
+        return a.id.toLowerCase() < b.id.toLowerCase();
+    });
+
+    return items;
+}
+
+juce::String sampleLayerPathHintFromPatch(const juce::var& patchVar)
+{
+    auto* patchObj = patchVar.getDynamicObject();
+    if (patchObj == nullptr)
+        return {};
+
+    auto sampleLayers = patchObj->getProperty("sample_layers");
+    auto* sampleLayerArray = sampleLayers.getArray();
+    if (sampleLayerArray == nullptr || sampleLayerArray->size() != 1)
+        return {};
+
+    auto* layerObj = (*sampleLayerArray)[0].getDynamicObject();
+    if (layerObj == nullptr)
+        return {};
+
+    return layerObj->getProperty("path_hint").toString().trim();
+}
+
+bool isRockFamilyGenre(const juce::String& genre)
+{
+    if (genre.isEmpty())
+        return false;
+
+    const auto g = genre.toLowerCase().replaceCharacter('_', ' ');
+
+    // Exact matches
+    if (g == "rock")
+        return true;
+
+    // Rock family genres (check contains to handle variations like "classic_rock", "classic rock", etc.)
+    return g.contains("rock") && (g.contains("classic") || g.contains("alternative") ||
+                                    g.contains("grunge") || g.contains("punk") ||
+                                    g.contains("indie") || g.contains("hard") ||
+                                    g.contains("soft") || g.contains("prog"));
+}
+
+std::vector<juce::String> preferredCategoriesForTrack(const juce::String& trackName, const juce::String& genre)
+{
+    const auto name = trackName.toLowerCase();
+    const bool isRock = isRockFamilyGenre(genre);
+
+    // Explicit guitar mention in track name always prefers guitar first
+    if (name.contains("guitar"))
+        return { "guitar", "keys", "synth", "pad", "strings", "brass" };
+
+    if (name.contains("drum") || name.contains("perc"))
+        return { "kick", "snare", "clap", "hihat", "perc", "drums" };
+
+    if (name.contains("bass") || name.contains("808"))
+        return { "bass", "808" };
+
+    if (name.contains("chord") || name.contains("pad") || name.contains("keys") || name.contains("piano"))
+    {
+        if (isRock)
+            return { "guitar", "pad", "keys", "synth", "strings", "brass" };
+        return { "pad", "keys", "synth", "strings", "brass" };
+    }
+
+    if (name.contains("melody") || name.contains("lead") || name.contains("arp"))
+    {
+        if (isRock)
+            return { "guitar", "synth", "keys", "strings", "brass", "pad" };
+        return { "synth", "keys", "strings", "brass", "pad" };
+    }
+
+    return { "synth", "keys", "pad", "strings", "brass", "bass" };
+}
+
+juce::var loadGeneratedOutputPropertyForCurrentMidi(const juce::String& midiPath,
+                                                    const juce::String& propertyName)
+{
+    if (midiPath.isEmpty())
+        return {};
+
+    auto midiFile = juce::File(midiPath);
+    auto metadataFile = midiFile.getParentDirectory().getChildFile("project_metadata.json");
+    if (!metadataFile.existsAsFile())
+        return {};
+
+    auto json = juce::JSON::parse(metadataFile);
+    if (auto* obj = json.getDynamicObject())
+    {
+        auto current = obj->getProperty("current");
+        if (auto* currentObj = current.getDynamicObject())
+        {
+            auto outputs = currentObj->getProperty("outputs");
+            if (auto* outputsObj = outputs.getDynamicObject())
+            {
+                auto midiRel = outputsObj->getProperty("midi").toString();
+                if (midiRel.isNotEmpty() && midiFile.getFileName() == juce::File(midiRel).getFileName())
+                    return outputsObj->getProperty(juce::Identifier(propertyName));
+            }
+        }
+    }
+
+    return {};
+}
+
+std::vector<juce::String> patchFamilyKeywords(const juce::String& family)
+{
+    const auto normalized = family.toLowerCase();
+
+    if (normalized == "guitar") return { "guitar", "gtr" };
+    if (normalized == "keys") return { "keys", "piano", "rhodes", "clav", "epiano" };
+    if (normalized == "bass") return { "bass", "808" };
+    if (normalized == "synth") return { "synth", "analog" };
+    if (normalized == "pad") return { "pad", "pads" };
+    if (normalized == "brass") return { "brass", "horn", "trumpet", "trombone", "sax" };
+    if (normalized == "strings") return { "strings", "violin", "cello", "ensemble" };
+    if (normalized == "organ") return { "organ", "hammond", "drawbar" };
+    if (normalized == "choir") return { "choir", "voice", "voices", "vocal" };
+    if (normalized == "ethiopian_string") return { "krar", "masenqo", "begena", "ethio" };
+    if (normalized == "ethiopian_flute") return { "washint", "flute", "reed" };
+
+    return { normalized };
+}
+
+bool trackNameContainsAnyFamilyHint(const juce::String& trackName)
+{
+    static const std::vector<juce::String> knownHints = {
+        "guitar", "gtr", "keys", "piano", "rhodes", "clav", "epiano",
+        "bass", "synth", "organ", "hammond", "drawbar", "choir", "voice",
+        "strings", "violin", "cello", "brass", "horn", "trumpet", "trombone",
+        "sax", "krar", "masenqo", "washint", "begena", "flute", "reed"
+    };
+
+    const auto lowerName = trackName.toLowerCase();
+    for (const auto& hint : knownHints)
+    {
+        if (lowerName.contains(hint))
+            return true;
+    }
+
+    return false;
+}
+
+bool trackNameMatchesPatchFamily(const juce::String& trackName, const juce::String& family)
+{
+    const auto lowerName = trackName.toLowerCase();
+    for (const auto& keyword : patchFamilyKeywords(family))
+    {
+        if (keyword.isNotEmpty() && lowerName.contains(keyword))
+            return true;
+    }
+
+    return false;
+}
+
+bool trackNameMatchesPatchRole(const juce::String& trackName, const juce::String& role)
+{
+    const auto lowerName = trackName.toLowerCase();
+    const auto normalizedRole = role.toLowerCase();
+
+    if (normalizedRole == "bass")
+        return lowerName.contains("bass") || lowerName.contains("808");
+
+    if (normalizedRole == "chords")
+        return lowerName.contains("chord") || lowerName.contains("guitar") || lowerName.contains("keys")
+               || lowerName.contains("piano") || lowerName.contains("rhodes") || lowerName.contains("clav");
+
+    if (normalizedRole == "melody")
+        return lowerName.contains("melody") || lowerName.contains("lead") || lowerName.contains("arp")
+               || lowerName.contains("hook") || lowerName.contains("solo") || lowerName.contains("synth")
+               || lowerName.contains("brass") || lowerName.contains("horn") || lowerName.contains("trumpet")
+               || lowerName.contains("trombone") || lowerName.contains("sax") || lowerName.contains("flute")
+               || lowerName.contains("washint") || lowerName.contains("krar") || lowerName.contains("masenqo");
+
+    if (normalizedRole == "pad")
+        return lowerName.contains("pad") || lowerName.contains("strings") || lowerName.contains("organ")
+               || lowerName.contains("choir");
+
+    if (normalizedRole == "drone")
+        return lowerName.contains("drone") || lowerName.contains("begena");
+
+    if (normalizedRole == "drums" || normalizedRole == "perc")
+        return lowerName.contains("drum") || lowerName.contains("perc");
+
+    return false;
+}
+
+std::vector<juce::String> previewCategoriesForPatchFamily(const juce::String& family)
+{
+    const auto normalized = family.toLowerCase();
+
+    if (normalized == "guitar") return { "guitar" };
+    if (normalized == "keys") return { "keys" };
+    if (normalized == "bass") return { "bass" };
+    if (normalized == "synth") return { "synth" };
+    if (normalized == "pad") return { "pad" };
+    if (normalized == "brass") return { "brass" };
+    if (normalized == "strings") return { "strings" };
+    if (normalized == "organ") return { "keys", "pad" };
+    if (normalized == "choir") return { "pad" };
+
+    return {};
+}
+
+bool trackNameSupportsPatchFamily(const juce::String& trackName,
+                                  const juce::String& genre,
+                                  const juce::String& family)
+{
+    if (trackNameMatchesPatchFamily(trackName, family))
+        return true;
+
+    if (trackNameContainsAnyFamilyHint(trackName))
+        return false;
+
+    const auto previewCategories = previewCategoriesForPatchFamily(family);
+    if (previewCategories.empty())
+        return false;
+
+    const auto preferred = preferredCategoriesForTrack(trackName, genre);
+    for (const auto& category : previewCategories)
+    {
+        for (const auto& preferredCategory : preferred)
+        {
+            if (preferredCategory.equalsIgnoreCase(category))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+juce::File inferRenderReportFile(const GenerationResult& result)
+{
+    if (result.renderReportPath.isNotEmpty())
+    {
+        juce::File explicitReport(result.renderReportPath);
+        if (explicitReport.existsAsFile())
+            return explicitReport;
+    }
+
+    auto candidateFor = [](const juce::String& path) -> juce::File
+    {
+        if (path.isEmpty())
+            return {};
+        juce::File file(path);
+        if (!file.existsAsFile())
+            return {};
+        return file.getSiblingFile(file.getFileNameWithoutExtension() + "_render_report.json");
+    };
+
+    auto audioReport = candidateFor(result.audioPath);
+    if (audioReport.existsAsFile())
+        return audioReport;
+
+    auto midiReport = candidateFor(result.midiPath);
+    if (midiReport.existsAsFile())
+        return midiReport;
+
+    return {};
+}
+
+juce::String varArrayToCsv(const juce::var& value, int maxItems = 4)
+{
+    juce::StringArray out;
+    if (auto* arr = value.getArray())
+    {
+        for (int i = 0; i < arr->size() && i < maxItems; ++i)
+            out.add((*arr)[i].toString());
+    }
+    return out.joinIntoString(", ");
+}
+
+bool appendProgramSummary(juce::String& summary, const juce::var& statuses)
+{
+    if (!statuses.isArray())
+        return false;
+
+    auto* statusArray = statuses.getArray();
+    juce::StringArray programBits;
+    for (int i = 0; i < statusArray->size() && programBits.size() < 6; ++i)
+    {
+        if (auto* obj = (*statusArray)[i].getDynamicObject())
+        {
+            auto track = obj->getProperty("track_name").toString();
+            auto names = varArrayToCsv(obj->getProperty("gm_program_names"), 3);
+            auto family = obj->getProperty("patch_family").toString();
+            auto sourceQuality = obj->getProperty("source_quality").toString();
+            if (names.isNotEmpty())
+            {
+                juce::String bit;
+                bit << track << "=" << names;
+                if (sourceQuality.isNotEmpty())
+                    bit << " [" << sourceQuality << "]";
+                programBits.add(bit);
+            }
+            else if (family.isNotEmpty())
+            {
+                juce::String bit;
+                bit << track << "=" << family;
+                programBits.add(bit);
+            }
+        }
+    }
+
+    if (programBits.isEmpty())
+        return false;
+
+    summary << "Programs: " << programBits.joinIntoString("; ") << "\n";
+    return true;
+}
+
+bool appendPipelineStageSummary(juce::String& summary, const juce::var& stages)
+{
+    if (!stages.isObject())
+        return false;
+
+    auto* stagesObj = stages.getDynamicObject();
+    if (stagesObj == nullptr)
+        return false;
+
+    juce::StringArray stageNames;
+    for (const auto& prop : stagesObj->getProperties())
+    {
+        auto name = prop.name.toString().upToFirstOccurrenceOf(".", false, false);
+        if (name.isNotEmpty() && !stageNames.contains(name))
+            stageNames.add(name);
+    }
+
+    if (!stageNames.isEmpty())
+        summary << "Stages: " << stageNames.joinIntoString(", ") << "\n";
+
+    auto profile = stagesObj->getProperty("fluidsynth_file_mastering.profile").toString();
+    auto gainFloor = stagesObj->getProperty("fluidsynth_file_mastering.gain_floor").toString();
+    auto reverb = stagesObj->getProperty("fluidsynth_file_mastering.reverb_send").toString();
+    if (profile.isNotEmpty()) summary << "Profile: " << profile << "\n";
+    if (reverb.isNotEmpty()) summary << "Reverb send: " << reverb << "\n";
+    if (gainFloor.isNotEmpty()) summary << "Gain floor: " << gainFloor << "\n";
+
+    return !stageNames.isEmpty() || profile.isNotEmpty() || reverb.isNotEmpty() || gainFloor.isNotEmpty();
+}
+
+void appendAnalysisSummary(juce::String& summary, const juce::var& rootVar)
+{
+    if (auto* root = rootVar.getDynamicObject())
+    {
+        if (auto audioAnalysis = root->getProperty("audio_analysis"); audioAnalysis.isObject())
+        {
+            if (auto* analysisObj = audioAnalysis.getDynamicObject())
+            {
+                summary << "Analysis: "
+                        << (static_cast<bool>(analysisObj->getProperty("passed")) ? "passed" : "needs review")
+                        << ", score=" << analysisObj->getProperty("genre_match_score").toString()
+                        << "\n";
+            }
+        }
+    }
+}
+
+juce::String summarizeRenderReport(const GenerationResult& result)
+{
+    juce::String summary;
+    bool hasRenderer = false;
+    bool hasPrograms = false;
+    bool hasStages = false;
+
+    if (result.rendererPath.isNotEmpty())
+    {
+        summary << "Renderer: " << result.rendererPath << "\n";
+        hasRenderer = true;
+    }
+
+    if (result.trackProgramsJson.isNotEmpty())
+        hasPrograms = appendProgramSummary(summary, juce::JSON::parse(result.trackProgramsJson));
+
+    if (result.pipelineStagesJson.isNotEmpty())
+        hasStages = appendPipelineStageSummary(summary, juce::JSON::parse(result.pipelineStagesJson));
+
+    auto reportFile = inferRenderReportFile(result);
+    if (!reportFile.existsAsFile())
+        return summary.isNotEmpty() ? summary : "Render report: (not found)\n";
+
+    auto parsed = juce::JSON::parse(reportFile);
+    if (!parsed.isObject())
+        return summary.isNotEmpty() ? summary : "Render report: (unreadable)\n";
+
+    auto* root = parsed.getDynamicObject();
+    if (root == nullptr)
+        return summary.isNotEmpty() ? summary : "Render report: (unreadable)\n";
+
+    if (!hasRenderer)
+        summary << "Renderer: " << root->getProperty("renderer_path").toString() << "\n";
+
+    if (!hasPrograms)
+        appendProgramSummary(summary, root->getProperty("track_realization_statuses"));
+
+    appendAnalysisSummary(summary, parsed);
+
+    if (!hasStages)
+        appendPipelineStageSummary(summary, root->getProperty("pipeline_stages"));
+
+    return summary;
+}
+
+juce::String firstUsefulGenerationDiagnosticLine(const juce::String& summary)
+{
+    juce::StringArray lines;
+    lines.addLines(summary);
+
+    for (const auto& line : lines)
+    {
+        const auto trimmed = line.trim();
+        const auto lower = trimmed.toLowerCase();
+        if (trimmed.isNotEmpty()
+            && (lower.startsWith("programs:")
+                || lower.startsWith("stages:")
+                || lower.startsWith("profile:")
+                || lower.startsWith("gain floor:")
+                || lower.startsWith("reverb send:")))
+            return trimmed;
+    }
+
+    return {};
+}
+
+juce::String summaryValueAfterPrefix(const juce::String& summary, const juce::String& prefix)
+{
+    juce::StringArray lines;
+    lines.addLines(summary);
+
+    for (const auto& line : lines)
+    {
+        const auto trimmed = line.trim();
+        if (trimmed.startsWithIgnoreCase(prefix))
+            return trimmed.fromFirstOccurrenceOf(prefix, false, true).trim();
+    }
+
+    return {};
+}
+
+juce::String compactRendererBadgeText(const juce::String& renderer)
+{
+    const auto trimmed = renderer.trim();
+    if (trimmed.isEmpty())
+        return {};
+
+    if (trimmed.containsChar('/') || trimmed.containsChar('\\'))
+    {
+        const auto fileName = juce::File(trimmed).getFileNameWithoutExtension();
+        if (fileName.isNotEmpty())
+            return fileName;
+    }
+
+    return trimmed;
+}
+
+struct DefaultSynthPreviewSubset
+{
+    bool hasWaveform = false;
+    int waveformId = 1;
+    bool hasAttack = false;
+    float attackSeconds = 0.001f;
+    bool hasDecay = false;
+    float decaySeconds = 0.0f;
+    bool hasSustain = false;
+    float sustainLevel = 1.0f;
+    bool hasRelease = false;
+    float releaseSeconds = 0.2f;
+    bool hasCutoff = false;
+    float cutoffHz = 16000.0f;
+    bool hasCutoffVelocityDelta = false;
+    float cutoffVelocityDeltaHz = 0.0f;
+    bool hasLfoRate = false;
+    float lfoRateHz = 0.0f;
+    bool hasLfoDepth = false;
+    float lfoDepth = 0.0f;
+
+    bool hasAnyValue() const
+    {
+        return hasWaveform || hasAttack || hasDecay || hasSustain || hasRelease
+               || hasCutoff || hasCutoffVelocityDelta || hasLfoRate || hasLfoDepth;
+    }
+};
+
+int waveformIdForPatchAlgorithm(const juce::String& algorithm)
+{
+    const auto normalized = algorithm.toLowerCase();
+
+    if (normalized == "sine") return 1;
+    if (normalized == "triangle") return 2;
+    if (normalized == "saw") return 3;
+    if (normalized == "square" || normalized == "pulse") return 4;
+
+    // The bounded JUCE preview path only supports sine/triangle/saw/square.
+    // Richer/physical-model algorithms such as FM or Karplus-Strong therefore
+    // fold down to a harmonic-safe Saw fallback for default-synth preview only.
+    return 3;
+}
+
+DefaultSynthPreviewSubset buildDefaultSynthPreviewSubset(const juce::var& patchVar)
+{
+    DefaultSynthPreviewSubset subset;
+
+    auto* patchObj = patchVar.getDynamicObject();
+    if (patchObj == nullptr)
+        return subset;
+
+    auto synthesisVoice = patchObj->getProperty("synthesis_voice");
+    auto* voiceObj = synthesisVoice.getDynamicObject();
+    if (voiceObj == nullptr)
+        return subset;
+
+    if (auto oscillators = voiceObj->getProperty("oscillators"); oscillators.isArray() && oscillators.size() > 0)
+    {
+        if (auto* primaryOscillator = oscillators[0].getDynamicObject())
+        {
+            subset.hasWaveform = true;
+            subset.waveformId = juce::jlimit(1, 4,
+                                             waveformIdForPatchAlgorithm(primaryOscillator->getProperty("algorithm").toString()));
+        }
+    }
+
+    if (auto ampEnvelope = voiceObj->getProperty("amp_envelope"); ampEnvelope.isObject())
+    {
+        if (auto* ampEnvelopeObj = ampEnvelope.getDynamicObject())
+        {
+            subset.hasAttack = true;
+            subset.attackSeconds = juce::jlimit(0.001f, 2.0f,
+                                                0.001f * (float)ampEnvelopeObj->getProperty("attack_ms"));
+
+            const auto decayMs = ampEnvelopeObj->getProperty("decay_ms");
+            if (!decayMs.isVoid())
+            {
+                subset.hasDecay = true;
+                subset.decaySeconds = juce::jlimit(0.0f, 5.0f,
+                                                   0.001f * (float)decayMs);
+            }
+
+            const auto sustainLevel = ampEnvelopeObj->getProperty("sustain_level");
+            if (!sustainLevel.isVoid())
+            {
+                subset.hasSustain = true;
+                subset.sustainLevel = juce::jlimit(0.0f, 1.0f,
+                                                   (float)sustainLevel);
+            }
+
+            subset.hasRelease = true;
+            subset.releaseSeconds = juce::jlimit(0.01f, 5.0f,
+                                                 0.001f * (float)ampEnvelopeObj->getProperty("release_ms"));
+        }
+    }
+
+    if (auto filter = voiceObj->getProperty("filter"); filter.isObject())
+    {
+        if (auto* filterObj = filter.getDynamicObject())
+        {
+            if (filterObj->getProperty("mode").toString().equalsIgnoreCase("lowpass"))
+            {
+                subset.hasCutoff = true;
+                subset.cutoffHz = juce::jlimit(50.0f, 20000.0f,
+                                               (float)filterObj->getProperty("cutoff_hz"));
+            }
+        }
+    }
+
+    if (auto velocityMap = voiceObj->getProperty("velocity_map"); velocityMap.isObject())
+    {
+        if (auto* velocityMapObj = velocityMap.getDynamicObject())
+        {
+            const auto cutoffDeltaHz = velocityMapObj->getProperty("cutoff_delta_hz");
+            if (!cutoffDeltaHz.isVoid())
+            {
+                subset.hasCutoffVelocityDelta = true;
+                subset.cutoffVelocityDeltaHz = juce::jlimit(-20000.0f, 20000.0f,
+                                                            (float)cutoffDeltaHz);
+            }
+        }
+    }
+
+    if (auto lfos = voiceObj->getProperty("lfos"); lfos.isArray())
+    {
+        for (int i = 0; i < lfos.size(); ++i)
+        {
+            if (auto* lfoObj = lfos[i].getDynamicObject())
+            {
+                if (!lfoObj->getProperty("target").toString().equalsIgnoreCase("amp"))
+                    continue;
+
+                subset.hasLfoRate = true;
+                subset.lfoRateHz = juce::jlimit(0.0f, 20.0f,
+                                                (float)lfoObj->getProperty("rate_hz"));
+                subset.hasLfoDepth = true;
+                subset.lfoDepth = juce::jlimit(0.0f, 1.0f,
+                                               (float)lfoObj->getProperty("depth"));
+                break;
+            }
+        }
+    }
+
+    return subset;
+}
+
+juce::File resolveDefaultOutputDir()
+{
+    auto appDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+
+    juce::Array<juce::File> candidates = {
+        appDir.getParentDirectory().getParentDirectory().getParentDirectory().getParentDirectory().getChildFile("output"),
+        appDir.getSiblingFile("output"),
+        juce::File("C:/dev/AI Music Generator/multimodal-ai-music-gen/output")
+    };
+
+    for (const auto& dir : candidates)
+    {
+        if (dir.isDirectory())
+            return dir;
+    }
+
+    // Fallback: use app dir / output even if it doesn't exist yet.
+    return appDir.getSiblingFile("output");
+}
+
+void appendGenerateLog(const juce::File& outputDir, const juce::String& requestId, const juce::String& prompt)
+{
+    auto logFile = outputDir.getChildFile(kGenerateLogName);
+    auto timestamp = juce::Time::getCurrentTime().toString(true, true);
+    auto line = timestamp + " | request_id=" + requestId + " | prompt=" + prompt + "\n";
+    logFile.appendText(line);
+}
+
+juce::String formatGenerationStatus(MainComponent::GenerationStatus status,
+                                    const juce::String& requestId,
+                                    const juce::Time& sentTime,
+                                    const juce::Time& ackTime,
+                                    const juce::Time& doneTime)
+{
+    juce::String statusLabel = "Idle";
+    switch (status)
+    {
+        case MainComponent::GenerationStatus::RequestSent: statusLabel = "Request sent"; break;
+        case MainComponent::GenerationStatus::Acknowledged: statusLabel = "Ack received"; break;
+        case MainComponent::GenerationStatus::Completed: statusLabel = "Complete"; break;
+        case MainComponent::GenerationStatus::Cancelled: statusLabel = "Cancelled"; break;
+        case MainComponent::GenerationStatus::Error: statusLabel = "Error"; break;
+        case MainComponent::GenerationStatus::Idle:
+        default: break;
+    }
+
+    juce::String timeLabel;
+    if (status == MainComponent::GenerationStatus::RequestSent)
+        timeLabel = sentTime.toString(true, true);
+    else if (status == MainComponent::GenerationStatus::Acknowledged)
+        timeLabel = ackTime.toString(true, true);
+    else if (status == MainComponent::GenerationStatus::Completed)
+        timeLabel = doneTime.toString(true, true);
+
+    juce::String idShort = requestId;
+    if (idShort.length() > 8)
+        idShort = idShort.substring(0, 8);
+
+    juce::String out = "Gen: " + statusLabel;
+    if (idShort.isNotEmpty())
+        out += " (" + idShort + ")";
+    if (timeLabel.isNotEmpty())
+        out += " @ " + timeLabel;
+    return out;
+}
+
+juce::String analysisDisplayKey(const AnalyzeResult& result)
+{
+    if (result.key.isEmpty())
+        return {};
+
+    auto key = result.key;
+    if (result.mode == "minor")
+        key << "m";
+    else if (result.mode.isNotEmpty() && result.mode != "major")
+        key << " " << result.mode;
+    return key;
+}
+
+juce::String buildAnalyzeSummary(const AnalyzeResult& result)
+{
+    juce::StringArray parts;
+    if (result.bpm > 0.0f)
+        parts.add("BPM " + juce::String(result.bpm, 1));
+    if (auto key = analysisDisplayKey(result); key.isNotEmpty())
+        parts.add("Key " + key);
+    if (result.estimatedGenre.isNotEmpty())
+        parts.add("Genre " + result.estimatedGenre);
+    if (result.styleTags.size() > 0)
+        parts.add("Tags " + result.styleTags.joinIntoString(", "));
+
+    if (parts.isEmpty())
+        return "Reference hints returned via /analyze.";
+
+    return parts.joinIntoString(" • ");
+}
+
+juce::String buildAnalyzeDetail(const AnalyzeResult& result)
+{
+    if (result.promptHints.isNotEmpty())
+        return "Prompt hints: " + result.promptHints;
+
+    if (result.styleTags.size() > 0)
+        return "Hints only — no settings have been auto-applied.";
+
+    return "Hints only — no auto-apply, no in-panel spectrum/apply path.";
+}
+
+bool isResolutionFallbackLike(const ResolvedInstrumentInfo& result)
+{
+    const auto matchType = result.matchType.toLowerCase();
+    return matchType == "default" || matchType.contains("fallback");
+}
+
+void includeVisibleBounds(juce::Rectangle<int>& aggregate, const juce::Component* component)
+{
+    if (component == nullptr || ! component->isVisible())
+        return;
+
+    const auto bounds = component->getBounds();
+    if (bounds.isEmpty())
+        return;
+
+    aggregate = aggregate.isEmpty() ? bounds : aggregate.getUnion(bounds);
+}
+
+juce::Rectangle<int> makeShellBounds(juce::Rectangle<int> bounds,
+                                     const juce::Rectangle<int>& limit,
+                                     int horizontalPad,
+                                     int verticalPad)
+{
+    if (bounds.isEmpty())
+        return {};
+
+    return bounds.expanded(horizontalPad, verticalPad).getIntersection(limit);
+}
+
+void drawShellWell(juce::Graphics& g,
+                   juce::Rectangle<int> bounds,
+                   juce::Colour accentColour,
+                   bool accentOnTop = true)
+{
+    if (bounds.isEmpty())
+        return;
+
+    auto outer = bounds.toFloat();
+    const float radius = Layout::borderRadiusLG;
+
+    g.setColour(AppColours::surfaceRaised.withAlpha(0.38f));
+    g.fillRoundedRectangle(outer, radius);
+
+    auto inner = outer.reduced(1.0f);
+    g.setColour(AppColours::surfaceSunken.withAlpha(0.82f));
+    g.fillRoundedRectangle(inner, juce::jmax(0.0f, radius - 1.0f));
+
+    g.setColour(juce::Colours::black.withAlpha(0.24f));
+    g.drawRoundedRectangle(outer, radius, 1.0f);
+
+    g.setColour(AppColours::borderSubtle.withAlpha(0.95f));
+    g.drawRoundedRectangle(inner, juce::jmax(0.0f, radius - 1.0f), 1.0f);
+
+    auto accentBounds = bounds.reduced(Layout::paddingLG, Layout::paddingSM);
+    if (accentBounds.isEmpty())
+        return;
+
+    accentBounds = accentOnTop ? accentBounds.removeFromTop(Layout::paddingXS)
+                               : accentBounds.removeFromLeft(Layout::paddingXS);
+
+    if (accentBounds.isEmpty())
+        return;
+
+    g.setColour(accentColour.withAlpha(0.52f));
+    g.fillRoundedRectangle(accentBounds.toFloat(), Layout::borderRadiusSM);
+}
+
+void drawStatusSegment(juce::Graphics& g,
+                       juce::Rectangle<int> bounds,
+                       juce::Colour accentColour)
+{
+    if (bounds.isEmpty())
+        return;
+
+    auto outer = bounds.toFloat();
+    const float radius = Layout::borderRadiusSM;
+
+    g.setColour(AppColours::mpcControlBg.withAlpha(0.96f));
+    g.fillRoundedRectangle(outer, radius);
+
+    auto inner = outer.reduced(0.75f);
+    g.setColour(AppColours::surfaceSunken.withAlpha(0.55f));
+    g.fillRoundedRectangle(inner, juce::jmax(0.0f, radius - 0.75f));
+
+    g.setColour(AppColours::mpcControlBorder.withAlpha(0.72f));
+    g.drawRoundedRectangle(inner, juce::jmax(0.0f, radius - 0.75f), 1.0f);
+
+    auto accentBounds = bounds.reduced(Layout::paddingSM, Layout::paddingXS).removeFromTop(Layout::paddingXS);
+    if (! accentBounds.isEmpty())
+    {
+        g.setColour(accentColour.withAlpha(0.48f));
+        g.fillRoundedRectangle(accentBounds.toFloat(), Layout::borderRadiusSM);
+    }
+}
+}
+
+//==============================================================================
+MainComponent::MainComponent(AppState& state, mmg::AudioEngine& engine)
+    : appState(state),
+      audioEngine(engine)
+{
+    appState.addListener(this);
+
+    // Listen to project state changes
+    appState.getProjectState().addStateListener(this);
+
+    // Set size with enforced minimum dimensions for responsive design
+    setSize(Layout::defaultWindowWidth, Layout::defaultWindowHeight);
+    
+    // Create Python manager and attempt to auto-start the server
+    pythonManager = std::make_unique<PythonManager>();
+    startPythonServer();
+    
+    // Create UI components
+    transportBar = std::make_unique<TransportComponent>(appState, audioEngine);
+    transportBar->addListener(this);  // Listen for Tools menu
+    transportBar->setVisible(true);
+    addAndMakeVisible(*transportBar);
+    
+    // Timeline component - hidden (we use ArrangementView's timeline ruler instead)
+    // Keeping for backward compatibility but not displayed
+    timelineComponent = std::make_unique<TimelineComponent>(appState, audioEngine);
+    timelineComponent->setBPM(appState.getBPM());
+    timelineComponent->addListener(this);
+    timelineComponent->setVisible(false);  // Hidden - MPC-style single timeline in arrangement
+    
+    promptPanel = std::make_unique<PromptPanel>(appState);
+    promptPanel->addListener(this);
+    promptPanel->setVisible(true);
+    addAndMakeVisible(*promptPanel);
+    
+    // Visualization panel with tabbed interface (Piano Roll + Recent Files)
+    visualizationPanel = std::make_unique<VisualizationPanel>(appState, audioEngine);
+    visualizationPanel->addListener(this);
+    visualizationPanel->setVisible(true);
+    addAndMakeVisible(*visualizationPanel);
+    
+    // Set output directory for visualization panel - use a more reliable path
+    auto appDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    
+    // Try multiple possible output locations
+    juce::Array<juce::File> possibleOutputDirs = {
+        appDir.getParentDirectory().getParentDirectory().getParentDirectory().getParentDirectory().getChildFile("output"),
+        appDir.getSiblingFile("output"),
+        juce::File("C:/dev/AI Music Generator/multimodal-ai-music-gen/output")
+    };
+    
+    for (auto& dir : possibleOutputDirs)
+    {
+        if (dir.isDirectory())
+        {
+            visualizationPanel->setOutputDirectory(dir);
+            break;
+        }
+    }
+    
+    progressOverlay = std::make_unique<ProgressOverlay>(appState);
+    progressOverlay->addListener(this);
+    addChildComponent(*progressOverlay); // Hidden by default
+    
+    // NB Phase 2: Genre-aware components
+    setupBottomPanel();
+    
+    // Force a layout update
+    resized();
+    
+    // Start timer for status updates (OSC setup happens in first timer callback)
+    startTimerHz(10);
+    
+    // Scan expansions immediately at startup
+    scanLocalExpansions();
+
+    // Apply any persisted per-track state (instrument + Default Synth params) to the audio engine.
+    // This avoids needing to click through tracks after startup or project load.
+    syncTrackAudioFromProjectState();
+}
+
+MainComponent::~MainComponent()
+{
+    appState.removeListener(this);
+    appState.getProjectState().removeStateListener(this);
+    stopTimer();
+    
+    // Close floating windows
+    instrumentsWindow.reset();
+    expansionsWindow.reset();
+    controlsWindow.reset();
+    
+    // Send graceful shutdown to Python server before cleaning up
+    stopPythonServer();
+    
+    if (oscBridge)
+        oscBridge->removeListener(this);
+    
+    if (transportBar)
+        transportBar->removeListener(this);
+    
+    if (visualizationPanel)
+        visualizationPanel->removeListener(this);
+    
+    if (genreSelector)
+        genreSelector->removeListener(this);
+    
+    if (instrumentBrowser)
+        instrumentBrowser->removeListener(this);
+    
+    if (fxChainPanel)
+        fxChainPanel->removeListener(this);
+    
+    if (expansionBrowser)
+        expansionBrowser->removeListener(this);
+}
+
+//==============================================================================
+// AppState::Listener
+void MainComponent::onNewProjectCreated()
+{
+    syncTrackAudioFromProjectState();
+}
+
+void MainComponent::onProjectLoaded(const juce::File& /*file*/)
+{
+    syncTrackAudioFromProjectState();
+}
+
+//==============================================================================
+void MainComponent::syncTrackAudioFromProjectState()
+{
+    auto mixerNode = appState.getProjectState().getMixerNode();
+    if (!mixerNode.isValid())
+        return;
+
+    for (const auto& child : mixerNode)
+    {
+        if (!child.hasType(Project::IDs::TRACK))
+            continue;
+
+        const int trackIndex = (int)child.getProperty(Project::IDs::index, 0);
+        juce::String instrumentId = child.getProperty(Project::IDs::instrumentId).toString();
+        if (instrumentId.isEmpty())
+            instrumentId = "default_sine";
+
+        // Reuse the same codepath as user selection so behavior stays consistent.
+        trackInstrumentSelected(trackIndex, instrumentId);
+    }
+}
+
+void MainComponent::applyDefaultSynthSettingsForTrackFromProjectState(int trackIndex)
+{
+    auto trackNode = appState.getProjectState().getTrackNode(trackIndex);
+    if (!trackNode.isValid())
+        return;
+
+    const int wfId = (int)trackNode.getProperty(Project::IDs::defaultSynthWaveform, 1);
+    mmg::AudioEngine::DefaultSynthWaveform waveformEnum = mmg::AudioEngine::DefaultSynthWaveform::Sine;
+    switch (wfId)
+    {
+        case 2: waveformEnum = mmg::AudioEngine::DefaultSynthWaveform::Triangle; break;
+        case 3: waveformEnum = mmg::AudioEngine::DefaultSynthWaveform::Saw; break;
+        case 4: waveformEnum = mmg::AudioEngine::DefaultSynthWaveform::Square; break;
+        case 1:
+        default: waveformEnum = mmg::AudioEngine::DefaultSynthWaveform::Sine; break;
+    }
+
+    audioEngine.setTrackDefaultSynthWaveform(trackIndex, waveformEnum);
+
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::AttackSeconds,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthAttack, 0.001f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::DecaySeconds,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthDecay, 0.0f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::SustainLevel,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthSustain, 1.0f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::ReleaseSeconds,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthRelease, 0.2f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::CutoffHz,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthCutoff, 16000.0f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::CutoffVelocityDeltaHz,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthCutoffVelocityDelta, 0.0f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::LfoRateHz,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthLfoRate, 5.0f));
+    audioEngine.setTrackDefaultSynthParam(trackIndex,
+                                          mmg::AudioEngine::DefaultSynthParam::LfoDepth,
+                                          (float)trackNode.getProperty(Project::IDs::defaultSynthLfoDepth, 0.0f));
+}
+
+void MainComponent::applyGeneratedInstrumentSamples(const GenerationResult& result)
+{
+    juce::var instrumentsVar = result.instrumentsUsed;
+
+    // Fallback to project_metadata.json if result didn't include instruments or sent an empty list.
+    auto* directInstrumentArray = instrumentsVar.getArray();
+    if (directInstrumentArray == nullptr || directInstrumentArray->isEmpty())
+        instrumentsVar = loadGeneratedOutputPropertyForCurrentMidi(result.midiPath, "instruments_used");
+
+    if (!instrumentsVar.isArray())
+    {
+        DBG("MainComponent: No instruments_used data available for auto-mapping.");
+        return;
+    }
+
+    std::map<juce::String, juce::var> instrumentByCategory;
+    if (auto* arr = instrumentsVar.getArray())
+    {
+        for (const auto& entry : *arr)
+        {
+            if (auto* instObj = entry.getDynamicObject())
+            {
+                auto category = instObj->getProperty("category").toString().toLowerCase();
+                auto path = instObj->getProperty("path").toString();
+                if (category.isNotEmpty() && path.isNotEmpty() && instrumentByCategory.find(category) == instrumentByCategory.end())
+                    instrumentByCategory[category] = entry;
+            }
+        }
+    }
+
+    if (instrumentByCategory.empty())
+    {
+        DBG("MainComponent: instruments_used present but empty after filtering.");
+        return;
+    }
+
+    auto mixerNode = appState.getProjectState().getMixerNode();
+    if (!mixerNode.isValid())
+        return;
+
+    for (const auto& child : mixerNode)
+    {
+        if (!child.hasType(Project::IDs::TRACK))
+            continue;
+
+        const int trackIndex = (int)child.getProperty(Project::IDs::index, 0);
+        const auto trackName = child.getProperty(Project::IDs::name).toString();
+        auto existingId = child.getProperty(Project::IDs::instrumentId).toString();
+        if (!isDefaultSynthInstrumentId(existingId))
+            continue;
+
+        juce::var selected;
+        auto preferred = preferredCategoriesForTrack(trackName, result.genre);
+        for (const auto& cat : preferred)
+        {
+            auto it = instrumentByCategory.find(cat);
+            if (it != instrumentByCategory.end())
+            {
+                selected = it->second;
+                break;
+            }
+        }
+
+        if (selected.isVoid() || !selected.isObject())
+        {
+            // If we can't find a category match for this track, keep the default synth.
+            // This prevents drum samples from being assigned to melodic tracks when
+            // instruments_used only contains drum categories.
+            if (preferred.empty())
+                selected = instrumentByCategory.begin()->second;
+            else
+                continue;
+        }
+
+        auto* selectedObj = selected.getDynamicObject();
+        if (!selectedObj)
+            continue;
+
+        auto samplePath = selectedObj->getProperty("path").toString();
+        auto sampleName = selectedObj->getProperty("name").toString();
+        if (samplePath.isEmpty())
+            continue;
+
+        juce::File sampleFile(samplePath);
+        if (!sampleFile.existsAsFile())
+        {
+            DBG("MainComponent: Sample file missing for track " << trackIndex << ": " << samplePath);
+            continue;
+        }
+
+        if (sampleName.isEmpty())
+            sampleName = sampleFile.getFileNameWithoutExtension();
+
+        auto instrumentId = juce::String(kSampleInstrumentPrefix) + sampleFile.getFullPathName();
+        auto trackNode = appState.getProjectState().getTrackNode(trackIndex);
+        if (trackNode.isValid())
+            trackNode.setProperty(Project::IDs::instrumentId, instrumentId, nullptr);
+
+        appState.getProjectState().setInstrument(trackIndex, sampleName, sampleFile.getFullPathName());
+        trackInstrumentSelected(trackIndex, instrumentId);
+    }
+}
+
+void MainComponent::applyGeneratedInstrumentPatchSubset(const GenerationResult& result)
+{
+    juce::var patchesVar = result.instrumentPatches;
+
+    // Fallback to project_metadata.json if result didn't include patches or sent an empty list.
+    auto* directPatchArray = patchesVar.getArray();
+    if (directPatchArray == nullptr || directPatchArray->isEmpty())
+        patchesVar = loadGeneratedOutputPropertyForCurrentMidi(result.midiPath, "instrument_patches");
+
+    if (!patchesVar.isArray())
+    {
+        DBG("MainComponent: No instrument_patches data available for default-synth preview adapter.");
+        return;
+    }
+
+    auto mixerNode = appState.getProjectState().getMixerNode();
+    if (!mixerNode.isValid())
+        return;
+
+    struct EligibleDefaultSynthTrack
+    {
+        int index = -1;
+        juce::String name;
+    };
+
+    std::vector<EligibleDefaultSynthTrack> eligibleTracks;
+    for (const auto& child : mixerNode)
+    {
+        if (!child.hasType(Project::IDs::TRACK))
+            continue;
+
+        const auto instrumentId = child.getProperty(Project::IDs::instrumentId).toString();
+        if (!isDefaultSynthInstrumentId(instrumentId))
+            continue;
+
+        eligibleTracks.push_back({
+            (int)child.getProperty(Project::IDs::index, 0),
+            child.getProperty(Project::IDs::name).toString()
+        });
+    }
+
+    if (eligibleTracks.empty())
+    {
+        DBG("MainComponent: No default-synth tracks remained eligible for InstrumentPatch preview mapping.");
+        return;
+    }
+
+    std::map<int, std::vector<juce::var>> matchedPatchesByTrack;
+
+    if (auto* patchArray = patchesVar.getArray())
+    {
+        for (const auto& patchVar : *patchArray)
+        {
+            auto* patchObj = patchVar.getDynamicObject();
+            if (patchObj == nullptr)
+                continue;
+
+            const auto trackRole = patchObj->getProperty("track_role").toString().toLowerCase();
+
+            juce::String family;
+            if (auto patchProfile = patchObj->getProperty("patch_profile"); patchProfile.isObject())
+            {
+                if (auto* patchProfileObj = patchProfile.getDynamicObject())
+                    family = patchProfileObj->getProperty("family").toString().toLowerCase();
+            }
+
+            if (trackRole.isEmpty() || family.isEmpty())
+                continue;
+
+            std::vector<int> candidateTracks;
+            for (const auto& track : eligibleTracks)
+            {
+                if (!trackNameMatchesPatchRole(track.name, trackRole))
+                    continue;
+
+                if (!trackNameSupportsPatchFamily(track.name, result.genre, family))
+                    continue;
+
+                candidateTracks.push_back(track.index);
+            }
+
+            if (candidateTracks.size() == 1)
+                matchedPatchesByTrack[candidateTracks.front()].push_back(patchVar);
+        }
+    }
+
+    if (matchedPatchesByTrack.empty())
+    {
+        DBG("MainComponent: instrument_patches were present but no default-synth tracks matched conservatively.");
+        return;
+    }
+
+    for (const auto& track : eligibleTracks)
+    {
+        auto it = matchedPatchesByTrack.find(track.index);
+        if (it == matchedPatchesByTrack.end())
+            continue;
+
+        if (it->second.size() != 1)
+        {
+            DBG("MainComponent: Skipping ambiguous InstrumentPatch match for track " << track.index
+                << " (" << track.name << ")");
+            continue;
+        }
+
+        const auto& matchedPatchVar = it->second.front();
+        if (auto samplePathHint = sampleLayerPathHintFromPatch(matchedPatchVar); samplePathHint.isNotEmpty())
+        {
+            juce::File sampleFile(samplePathHint);
+            if (sampleFile.existsAsFile())
+            {
+                auto sampleName = sampleFile.getFileNameWithoutExtension();
+                if (sampleName.isEmpty())
+                {
+                    if (auto* patchObj = matchedPatchVar.getDynamicObject())
+                        sampleName = patchObj->getProperty("display_name").toString();
+                }
+
+                auto instrumentId = juce::String(kSampleInstrumentPrefix) + sampleFile.getFullPathName();
+                auto trackNode = appState.getProjectState().getTrackNode(track.index);
+                if (trackNode.isValid())
+                    trackNode.setProperty(Project::IDs::instrumentId, instrumentId, nullptr);
+
+                appState.getProjectState().setInstrument(track.index, sampleName, sampleFile.getFullPathName());
+                trackInstrumentSelected(track.index, instrumentId);
+                continue;
+            }
+
+            DBG("MainComponent: InstrumentPatch sample hint missing for track " << track.index
+                << ": " << samplePathHint);
+        }
+
+        const auto subset = buildDefaultSynthPreviewSubset(matchedPatchVar);
+        if (!subset.hasAnyValue())
+            continue;
+
+        auto trackNode = appState.getProjectState().getTrackNode(track.index);
+        if (!trackNode.isValid())
+            continue;
+
+        trackNode.setProperty(Project::IDs::instrumentId, "default_sine", nullptr);
+
+        if (subset.hasWaveform)
+            trackNode.setProperty(Project::IDs::defaultSynthWaveform, subset.waveformId, nullptr);
+        if (subset.hasAttack)
+            trackNode.setProperty(Project::IDs::defaultSynthAttack, subset.attackSeconds, nullptr);
+        if (subset.hasDecay)
+            trackNode.setProperty(Project::IDs::defaultSynthDecay, subset.decaySeconds, nullptr);
+        if (subset.hasSustain)
+            trackNode.setProperty(Project::IDs::defaultSynthSustain, subset.sustainLevel, nullptr);
+        if (subset.hasRelease)
+            trackNode.setProperty(Project::IDs::defaultSynthRelease, subset.releaseSeconds, nullptr);
+        if (subset.hasCutoff)
+            trackNode.setProperty(Project::IDs::defaultSynthCutoff, subset.cutoffHz, nullptr);
+        if (subset.hasCutoffVelocityDelta)
+            trackNode.setProperty(Project::IDs::defaultSynthCutoffVelocityDelta, subset.cutoffVelocityDeltaHz, nullptr);
+        if (subset.hasLfoRate)
+            trackNode.setProperty(Project::IDs::defaultSynthLfoRate, subset.lfoRateHz, nullptr);
+        if (subset.hasLfoDepth)
+            trackNode.setProperty(Project::IDs::defaultSynthLfoDepth, subset.lfoDepth, nullptr);
+
+        // Reuse the existing default-synth seam so the engine stays aligned with the
+        // per-track project state without touching mastering/live-FX routing.
+        trackInstrumentSelected(track.index, "default_sine");
+    }
+}
+
+//==============================================================================
+void MainComponent::setupOSCConnection()
+{
+    oscBridge = std::make_unique<OSCBridge>(9001, 9000);
+    oscBridge->addListener(this);
+    
+    if (!oscBridge->connect())
+    {
+        DBG("Warning: Could not establish OSC connection");
+    }
+}
+
+//==============================================================================
+void MainComponent::setupBottomPanel()
+{
+    // Create all components first before adding listeners
+    
+    // Genre Selector - positioned above prompt panel
+    genreSelector = std::make_unique<GenreSelector>();
+    addAndMakeVisible(*genreSelector);
+    
+    // Instrument Browser - will be shown in floating window
+    instrumentBrowser = std::make_unique<InstrumentBrowserPanel>(audioEngine.getDeviceManager());
+    // NOT added to this component - goes in floating window
+    
+    // FX Chain Panel - shown in bottom panel when triggered
+    fxChainPanel = std::make_unique<FXChainPanel>();
+    fxChainPanel->setVisible(false);
+    fxChainPanel->setProjectState(&appState.getProjectState());
+    addAndMakeVisible(*fxChainPanel);
+    
+    // Expansion Browser Panel - will be shown in floating window
+    expansionBrowser = std::make_unique<ExpansionBrowserPanel>();
+    // NOT added to this component - goes in floating window
+    
+    // Mixer Component - shown in bottom panel when triggered
+    mixerComponent = std::make_unique<UI::MixerComponent>();
+    mixerComponent->setVisible(false);
+    mixerComponent->bindToProject(appState.getProjectState());
+    mixerComponent->setAudioEngine(&audioEngine);
+    
+    // Initialize mixer strips from project state
+    juce::StringArray trackNames;
+    auto mixerNode = appState.getProjectState().getMixerNode();
+    for (const auto& child : mixerNode)
+    {
+        if (child.hasType(Project::IDs::TRACK))
+            trackNames.add(child.getProperty(Project::IDs::name));
+    }
+    if (trackNames.isEmpty())
+    {
+        for (int i = 0; i < 4; ++i)
+            trackNames.add("Track " + juce::String(i + 1));
+    }
+    mixerComponent->setTracks(trackNames);
+    addAndMakeVisible(*mixerComponent);
+    
+    // Take Lane Panel - shown in bottom panel when triggered
+    takeLanePanel = std::make_unique<TakeLanePanel>();
+    takeLanePanel->setVisible(false);
+    addAndMakeVisible(*takeLanePanel);
+    
+    // Now add listeners AFTER all components are created
+    genreSelector->addListener(this);
+    instrumentBrowser->addListener(this);
+    fxChainPanel->addListener(this);
+    expansionBrowser->addListener(this);
+    takeLanePanel->addListener(this);
+    
+    // Sync currentGenre from GenreSelector's initial state (defaults to "auto")
+    currentGenre = genreSelector->getSelectedGenreId();
+    
+    // Request initial instrument data
+    if (instrumentBrowser)
+        instrumentBrowser->requestInstrumentData();
+}
+
+void MainComponent::toolsMenuItemSelected(int itemId)
+{
+    showToolWindow(itemId);
+}
+
+void MainComponent::showToolWindow(int toolId)
+{
+    // 1 = Instruments (floating), 2 = FX Chain (bottom), 3 = Expansions (floating), 4 = Mixer (bottom), 5 = Takes (bottom)
+    
+    switch (toolId)
+    {
+        case 1: // Instruments - floating window
+        {
+            if (!instrumentsWindow)
+            {
+                instrumentsWindow = std::make_unique<FloatingToolWindow>(
+                    "Instruments",
+                    AppColours::background,
+                    instrumentBrowser.get());
+                instrumentsWindow->setResizable(true, false);
+                instrumentsWindow->centreWithSize(600, 500);
+            }
+            instrumentsWindow->setVisible(true);
+            instrumentsWindow->toFront(true);
+            
+            // Request data if needed
+            if (instrumentBrowser)
+                instrumentBrowser->requestInstrumentData();
+            break;
+        }
+        
+        case 2: // FX Chain - bottom panel
+        {
+            if (currentBottomTool == 2 && bottomPanelVisible)
+            {
+                hideBottomPanel();
+            }
+            else
+            {
+                bottomPanelVisible = true;
+                currentBottomTool = 2;
+                if (fxChainPanel) fxChainPanel->setVisible(true);
+                if (mixerComponent) mixerComponent->setVisible(false);
+                if (takeLanePanel) takeLanePanel->setVisible(false);
+                resized();
+            }
+            break;
+        }
+        
+        case 3: // Expansions - floating window
+        {
+            if (!expansionsWindow)
+            {
+                expansionsWindow = std::make_unique<FloatingToolWindow>(
+                    "Expansions",
+                    AppColours::background,
+                    expansionBrowser.get());
+                expansionsWindow->setResizable(true, false);
+                expansionsWindow->centreWithSize(700, 500);
+            }
+            expansionsWindow->setVisible(true);
+            expansionsWindow->toFront(true);
+            
+            // Request expansion list
+            if (expansionBrowser)
+                expansionBrowser->requestExpansionList();
+            break;
+        }
+
+        case 6: // Controls - floating window
+        {
+            if (!controlsWindow)
+            {
+                controlsWindow = std::make_unique<ControlsWindow>();
+                if (auto* panel = controlsWindow->getControlsPanel())
+                    panel->addListener(this);
+            }
+
+            updateControlsNextOverridesUi();
+            controlsWindow->setVisible(true);
+            controlsWindow->toFront(true);
+            break;
+        }
+        
+        case 4: // Mixer - bottom panel
+        {
+            if (currentBottomTool == 4 && bottomPanelVisible)
+            {
+                hideBottomPanel();
+            }
+            else
+            {
+                bottomPanelVisible = true;
+                currentBottomTool = 4;
+                if (fxChainPanel) fxChainPanel->setVisible(false);
+                if (mixerComponent) mixerComponent->setVisible(true);
+                if (takeLanePanel) takeLanePanel->setVisible(false);
+                resized();
+            }
+            break;
+        }
+        
+        case 5: // Takes - bottom panel
+        {
+            if (currentBottomTool == 5 && bottomPanelVisible)
+            {
+                hideBottomPanel();
+            }
+            else
+            {
+                bottomPanelVisible = true;
+                currentBottomTool = 5;
+                if (fxChainPanel) fxChainPanel->setVisible(false);
+                if (mixerComponent) mixerComponent->setVisible(false);
+                if (takeLanePanel) takeLanePanel->setVisible(true);
+                resized();
+            }
+            break;
+        }
+        
+        case 7: // Mastering Suite - floating window
+        {
+            if (!masteringSuitePanel)
+            {
+                masteringSuitePanel = std::make_unique<MasteringSuitePanel>();
+                masteringSuitePanel->addListener(this);
+            }
+            
+            if (!masteringWindow)
+            {
+                masteringWindow = std::make_unique<FloatingToolWindow>(
+                    "Mastering Suite",
+                    AppColours::background,
+                    masteringSuitePanel.get());
+                masteringWindow->setResizable(true, false);
+                masteringWindow->centreWithSize(900, 700);
+            }
+            masteringWindow->setVisible(true);
+            masteringWindow->toFront(true);
+            break;
+        }
+    }
+}
+
+void MainComponent::controlsApplyGlobalRequested(const juce::var& overrides)
+{
+    if (!ensureBackendConnected("Apply global controls"))
+        return;
+
+    oscBridge->sendControlsSet(overrides);
+    currentStatus = "Applied global controls";
+    repaint();
+}
+
+void MainComponent::controlsClearGlobalRequested(const juce::StringArray& keys)
+{
+    if (!ensureBackendConnected("Clear global controls"))
+        return;
+
+    oscBridge->sendControlsClear(keys);
+    currentStatus = "Cleared global controls";
+    repaint();
+}
+
+bool MainComponent::ensureBackendConnected(const juce::String& actionLabel)
+{
+    if (oscBridge && oscBridge->isConnected())
+        return true;
+
+    const auto now = juce::Time::currentTimeMillis();
+
+    // Always attempt to (re)connect when an action requires the backend.
+    // This covers the common case where the server is started externally
+    // (e.g. `npm run start:server`) so pythonManager->isRunning() is false.
+    constexpr juce::int64 connectAttemptIntervalMs = 1000;
+    constexpr juce::int64 connectGracePeriodMs = 2000;
+    if (now - lastBackendConnectAttemptMs > connectAttemptIntervalMs)
+    {
+        lastBackendConnectAttemptMs = now;
+        setupOSCConnection();
+        repaint();
+    }
+
+    const bool pythonRunning = (pythonManager && pythonManager->isRunning());
+    if (pythonRunning || (now - lastBackendConnectAttemptMs) < connectGracePeriodMs)
+    {
+        // Server is likely coming up or reconnecting; avoid spamming a modal warning.
+        currentStatus = actionLabel + " (waiting for server connection...)";
+        repaint();
+        return false;
+    }
+
+    // Server isn't running; show a debounced warning.
+    if (now - lastBackendNotConnectedWarningMs > 2500)
+    {
+        lastBackendNotConnectedWarningMs = now;
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon,
+            "Not Connected",
+            "Python backend is not connected.\n\n"
+            "Start the server with:\n"
+            "npm run start:server\n\n"
+            "(or) python -m multimodal_gen.server --verbose"
+        );
+    }
+
+    currentStatus = "Server Offline";
+    repaint();
+    return false;
+}
+
+void MainComponent::hideBottomPanel()
+{
+    bottomPanelVisible = false;
+    currentBottomTool = 0;
+    if (fxChainPanel) fxChainPanel->setVisible(false);
+    if (mixerComponent) mixerComponent->setVisible(false);
+    if (takeLanePanel) takeLanePanel->setVisible(false);
+    resized();
+}
+
+void MainComponent::applyGenreTheme(const juce::String& genreId)
+{
+    currentGenre = genreId;
+    
+    // Guard against being called before components are ready
+    // Apply theme to visualization panel
+    if (visualizationPanel)
+        visualizationPanel->setGenre(genreId);
+    
+    // Apply genre-specific FX chain preset
+    if (fxChainPanel)
+        fxChainPanel->loadPreset(genreId);
+    
+    // Filter instruments by genre
+    if (instrumentBrowser)
+        instrumentBrowser->setGenreFilter(genreId);
+    
+    DBG("Applied genre theme: " + genreId);
+}
+
+void MainComponent::applyAnalysisResult(const AnalyzeResult& result)
+{
+    // Apply BPM if confidence is above threshold (0.5)
+    if (result.bpm > 0.0f && result.bpmConfidence >= 0.5f)
+    {
+        int bpm = static_cast<int>(result.bpm + 0.5f);  // Round to nearest int
+        appState.setBPM(bpm);
+        
+        // Update timeline
+        if (timelineComponent)
+            timelineComponent->setBPM(bpm);
+        
+        DBG("Applied BPM from analysis: " << bpm);
+    }
+    
+    // Apply key if confidence is above threshold
+    if (result.key.isNotEmpty() && result.keyConfidence >= 0.5f)
+    {
+        juce::String fullKey = result.key;
+        if (result.mode.isNotEmpty())
+            fullKey += " " + result.mode;
+        
+        appState.setKey(fullKey);
+        DBG("Applied key from analysis: " << fullKey);
+    }
+    
+    // Apply estimated genre if confidence is high enough and genre selector is available
+    if (result.estimatedGenre.isNotEmpty() && result.genreConfidence >= 0.6f && genreSelector)
+    {
+        // Map common genre names to our genre IDs
+        juce::String genreId = result.estimatedGenre.toLowerCase().replace(" ", "_");
+        
+        // Attempt to set the genre - GenreSelector will validate
+        genreSelector->setSelectedGenre(genreId);
+        DBG("Applied genre from analysis: " << genreId);
+    }
+    
+    // Apply prompt hints to prompt panel
+    if (result.promptHints.isNotEmpty() && promptPanel)
+    {
+        promptPanel->appendToPrompt(result.promptHints);
+        DBG("Applied prompt hints: " << result.promptHints);
+    }
+    
+    // Persist analysis in ProjectState for save/load
+    auto projectState = appState.getProjectState().getState();
+    auto analysisNode = projectState.getOrCreateChildWithName("LastAnalysis", nullptr);
+    analysisNode.setProperty("bpm", result.bpm, nullptr);
+    analysisNode.setProperty("bpmConfidence", result.bpmConfidence, nullptr);
+    analysisNode.setProperty("key", result.key, nullptr);
+    analysisNode.setProperty("mode", result.mode, nullptr);
+    analysisNode.setProperty("keyConfidence", result.keyConfidence, nullptr);
+    analysisNode.setProperty("estimatedGenre", result.estimatedGenre, nullptr);
+    analysisNode.setProperty("genreConfidence", result.genreConfidence, nullptr);
+    analysisNode.setProperty("promptHints", result.promptHints, nullptr);
+    
+    currentStatus = "Analysis applied";
+    repaint();
+}
+
+void MainComponent::scanLocalExpansions()
+{
+    // Determine expansions directory relative to the executable
+    auto appDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    
+    DBG("MainComponent::scanLocalExpansions - Starting expansion scan");
+    
+    // Try multiple possible expansion locations
+    juce::Array<juce::File> possibleExpansionDirs = {
+        // From Debug build output: .../juce/build/MultimodalMusicGen_artefacts/Debug/
+        // Need to go up 5 levels to get to "AI Music Generator"
+        appDir.getParentDirectory()  // MultimodalMusicGen_artefacts
+              .getParentDirectory()  // build
+              .getParentDirectory()  // juce  
+              .getParentDirectory()  // multimodal-ai-music-gen
+              .getParentDirectory()  // AI Music Generator
+              .getChildFile("expansions"),
+        juce::File("C:/dev/AI Music Generator/expansions")  // Absolute fallback
+    };
+    
+    for (auto& dir : possibleExpansionDirs)
+    {
+        if (dir.isDirectory())
+        {
+            DBG("  Found expansions directory: " << dir.getFullPathName());
+            int count = audioEngine.scanExpansions(dir);
+            DBG("  Scanned " << count << " expansions");
+            
+            // Get total instrument count
+            int totalInstruments = 0;
+            auto instrumentsByCategory = audioEngine.getInstrumentsByCategory();
+            for (const auto& [cat, instruments] : instrumentsByCategory)
+            {
+                DBG("    Category '" << cat << "': " << instruments.size() << " instruments");
+                totalInstruments += (int)instruments.size();
+            }
+            
+            DBG("  Total instruments loaded: " << totalInstruments);
+            
+            if (totalInstruments > 0)
+            {
+                // Pass to visualization panel (which passes to arrangement view)
+                if (visualizationPanel)
+                {
+                    visualizationPanel->setAvailableInstruments(instrumentsByCategory);
+                }
+                
+                currentStatus = "Loaded " + juce::String(totalInstruments) + " expansion instruments";
+            }
+            break;  // Stop after finding first valid directory
+        }
+    }
+}
+
+//==============================================================================
+void MainComponent::paint(juce::Graphics& g)
+{
+    // Background
+    g.fillAll(AppColours::background);
+
+    const int adaptivePadding = Layout::getAdaptivePadding(getWidth());
+    auto shellBounds = getLocalBounds()
+                           .withTrimmedTop(transportBar ? transportBar->getBottom() : 0)
+                           .withTrimmedBottom(Layout::statusBarHeight)
+                           .reduced(Layout::paddingSM, Layout::paddingXS);
+
+    juce::Rectangle<int> workflowBounds;
+    includeVisibleBounds(workflowBounds, genreSelector.get());
+    includeVisibleBounds(workflowBounds, promptPanel.get());
+
+    const auto workflowShell = makeShellBounds(workflowBounds,
+                                               shellBounds,
+                                               Layout::paddingSM,
+                                               Layout::paddingSM);
+    const auto mainShell = makeShellBounds(visualizationArea,
+                                           shellBounds,
+                                           Layout::paddingSM,
+                                           Layout::paddingSM);
+    const auto bottomShell = bottomPanelVisible
+                                 ? makeShellBounds(bottomPanelArea,
+                                                   shellBounds,
+                                                   Layout::paddingSM,
+                                                   Layout::paddingSM)
+                                 : juce::Rectangle<int>();
+
+    drawShellWell(g, workflowShell, AppColours::mpcAmber);
+    drawShellWell(g, mainShell, AppColours::mpcAccent);
+    if (bottomPanelVisible)
+        drawShellWell(g, bottomShell, AppColours::mpcAccentStrong);
+
+    if (! workflowShell.isEmpty() && ! mainShell.isEmpty())
+    {
+        const int gap = mainShell.getX() - workflowShell.getRight();
+        if (gap > Layout::paddingSM)
+        {
+            juce::Rectangle<int> separator((workflowShell.getRight() + mainShell.getX()) / 2 - 1,
+                                           workflowShell.getY() + adaptivePadding,
+                                           2,
+                                           juce::jmin(workflowShell.getBottom(), mainShell.getBottom()) - workflowShell.getY() - (adaptivePadding * 2));
+            if (! separator.isEmpty())
+            {
+                g.setColour(AppColours::mpcAccent.withAlpha(0.18f));
+                g.fillRoundedRectangle(separator.toFloat(), Layout::borderRadiusSM);
+            }
+        }
+    }
+
+    if (! mainShell.isEmpty() && ! bottomShell.isEmpty())
+    {
+        const int gap = bottomShell.getY() - mainShell.getBottom();
+        if (gap > Layout::paddingSM)
+        {
+            juce::Rectangle<int> separator(mainShell.getX() + adaptivePadding,
+                                           (mainShell.getBottom() + bottomShell.getY()) / 2 - 1,
+                                           mainShell.getWidth() - (adaptivePadding * 2),
+                                           2);
+            if (! separator.isEmpty())
+            {
+                g.setColour(AppColours::mpcAccentStrong.withAlpha(0.16f));
+                g.fillRoundedRectangle(separator.toFloat(), Layout::borderRadiusSM);
+            }
+        }
+    }
+    
+    // Status bar at bottom - clear, single source of truth for connection status
+    auto statusArea = getLocalBounds().removeFromBottom(Layout::statusBarHeight).reduced(Layout::paddingSM, Layout::paddingXS);
+    auto statusFrame = statusArea;
+
+    g.setColour(AppColours::surfaceRaised.withAlpha(0.78f));
+    g.fillRoundedRectangle(statusFrame.toFloat(), Layout::borderRadiusMD);
+
+    g.setColour(AppColours::surfaceSunken.withAlpha(0.92f));
+    g.fillRoundedRectangle(statusFrame.reduced(1).toFloat(), Layout::borderRadiusMD);
+
+    g.setColour(AppColours::borderSubtle.withAlpha(0.95f));
+    g.drawRoundedRectangle(statusFrame.toFloat().reduced(0.5f), Layout::borderRadiusMD, 1.0f);
+
+    auto statusAccent = statusFrame.reduced(Layout::paddingLG, Layout::paddingXS).removeFromTop(Layout::paddingXS);
+    if (! statusAccent.isEmpty())
+    {
+        g.setColour(AppColours::mpcAccent.withAlpha(0.30f));
+        g.fillRoundedRectangle(statusAccent.toFloat(), Layout::borderRadiusSM);
+    }
+
+    auto statusContent = statusFrame.reduced(Layout::paddingSM, Layout::paddingXS);
+    
+    // Connection status (left side) - use clear icon and text
+    juce::String connectionText;
+    juce::Colour connectionColour;
+    if (serverConnected)
+    {
+        connectionText = juce::String(juce::CharPointer_UTF8("● Server Connected"));
+        connectionColour = AppColours::success;
+    }
+    else
+    {
+        connectionText = juce::String(juce::CharPointer_UTF8("○ Server Offline - Start with: python main.py --server"));
+        connectionColour = AppColours::warning;
+    }
+    
+    const int connectionWidth = juce::jmin(380, juce::jmax(280, statusContent.getWidth() / 2));
+    const int rightWidth = juce::jmin(320, juce::jmax(260, statusContent.getWidth() / 3));
+
+    auto connectionArea = statusContent.removeFromLeft(connectionWidth).reduced(Layout::paddingXS, 0);
+    auto rightArea = statusContent.removeFromRight(rightWidth);
+    auto statusTextArea = rightArea.removeFromRight(juce::jmin(170, juce::jmax(140, rightArea.getWidth() - 120))).reduced(Layout::paddingXS, 0);
+    auto generationArea = rightArea.reduced(Layout::paddingXS, 0);
+    auto genreArea = statusContent.reduced(Layout::paddingXS, 0);
+
+    drawStatusSegment(g, connectionArea, connectionColour);
+    drawStatusSegment(g, genreArea, AppColours::mpcAmber);
+    drawStatusSegment(g, generationArea, AppColours::mpcAccent);
+    drawStatusSegment(g, statusTextArea, AppColours::mpcAccentStrong);
+
+    g.setFont(Layout::fontSizeSM);
+    g.setColour(connectionColour);
+    g.drawText(connectionText,
+               connectionArea.reduced(Layout::paddingMD, 0),
+               juce::Justification::centredLeft,
+               true);
+
+    // Current genre indicator (center) - show display name from GenreSelector
+    g.setColour(AppColours::textSecondary);
+    juce::String genreDisplay = currentGenre;
+    if (genreSelector)
+    {
+        if (auto* tmpl = genreSelector->getSelectedGenre())
+            genreDisplay = tmpl->displayName;
+    }
+        g.drawText("Genre: " + genreDisplay,
+                             genreArea.reduced(Layout::paddingMD, 0),
+                             juce::Justification::centred,
+                             true);
+
+    // Generation pipeline status (right, left aligned)
+    g.setColour(AppColours::textSecondary);
+    auto genStatusText = formatGenerationStatus(generationStatus,
+                                                generationRequestId,
+                                                generationRequestTime,
+                                                generationAckTime,
+                                                generationCompleteTime);
+        g.drawText(genStatusText,
+                             generationArea.reduced(Layout::paddingMD, 0),
+                             juce::Justification::centredLeft,
+                             true);
+    
+    // Current activity status (right side)
+    g.setColour(AppColours::textSecondary);
+        g.drawText(currentStatus,
+                             statusTextArea.reduced(Layout::paddingMD, 0),
+                             juce::Justification::centredRight,
+                             true);
+  }
+
+void MainComponent::resized()
+{
+    auto bounds = getLocalBounds();
+    
+    if (bounds.isEmpty())
+        return;  // Guard against zero-size
+    
+    // Enforce minimum size for responsive design
+    const int effectiveWidth = juce::jmax(bounds.getWidth(), Layout::minWindowWidth);
+    const int effectiveHeight = juce::jmax(bounds.getHeight(), Layout::minWindowHeight);
+    
+    // Get adaptive values based on window size
+    const int adaptivePadding = Layout::getAdaptivePadding(effectiveWidth);
+    const int adaptiveSidebarWidth = Layout::getAdaptiveSidebarWidth(effectiveWidth);
+    
+    // Reserve space for status bar
+    bounds.removeFromBottom(Layout::statusBarHeight);
+    
+    // Transport bar at top (use adaptive height)
+    int transportH = effectiveHeight > 700 ? Layout::transportHeightDefault : Layout::transportHeightMin;
+    if (transportBar)
+    {
+        transportBar->setBounds(bounds.removeFromTop(transportH));
+        transportBar->setVisible(true);
+    }
+    
+    // NO separate timeline - ArrangementView has its own ruler (MPC/ProTools style)
+    // timelineComponent stays hidden
+    
+    // Bottom panel with FX/Mixer/Takes - only when visible (toggle from Tools menu)
+    if (bottomPanelVisible)
+    {
+        int bottomPanelHeight = Layout::getAdaptiveBottomPanelHeight(bounds.getHeight());
+        auto bottomArea = bounds.removeFromBottom(bottomPanelHeight);
+        bottomPanelArea = bottomArea.reduced(adaptivePadding, 0);
+        
+        if (fxChainPanel && currentBottomTool == 2)
+            fxChainPanel->setBounds(bottomPanelArea);
+        if (mixerComponent && currentBottomTool == 4)
+            mixerComponent->setBounds(bottomPanelArea);
+        if (takeLanePanel && currentBottomTool == 5)
+            takeLanePanel->setBounds(bottomPanelArea);
+    }
+    
+    // Main content area - use FlexBox for responsive layout
+    auto contentArea = bounds.reduced(adaptivePadding);
+    
+    // Left column container (genre selector + prompt panel)
+    auto leftColumnBounds = contentArea.removeFromLeft(adaptiveSidebarWidth);
+    
+    // Genre selector at top of left column (fixed height)
+    if (genreSelector)
+    {
+        genreSelector->setBounds(leftColumnBounds.removeFromTop(60));
+        genreSelector->setVisible(true);
+    }
+    
+    leftColumnBounds.removeFromTop(adaptivePadding);
+    
+    // Prompt panel fills the rest of left column
+    if (promptPanel)
+    {
+        promptPanel->setBounds(leftColumnBounds);
+        promptPanel->setVisible(true);
+    }
+    
+    // Gap between left column and visualization
+    contentArea.removeFromLeft(adaptivePadding);
+    
+    // Visualization panel takes remaining space (now much larger without bottom tabs)
+    visualizationArea = contentArea;
+    
+    if (visualizationPanel)
+    {
+        visualizationPanel->setBounds(visualizationArea);
+        visualizationPanel->setVisible(true);
+    }
+    
+    // Progress overlay covers the whole component
+    if (progressOverlay)
+        progressOverlay->setBounds(getLocalBounds());
+    
+    // Force repaint
+    repaint();
+}
+
+//==============================================================================
+void MainComponent::drawPlaceholder(juce::Graphics& g, juce::Rectangle<int> area,
+                                   const juce::String& label, juce::Colour colour)
+{
+    // Background
+    g.setColour(colour);
+    g.fillRoundedRectangle(area.toFloat(), 6.0f);
+    
+    // Border
+    g.setColour(AppColours::border);
+    g.drawRoundedRectangle(area.toFloat(), 6.0f, 1.0f);
+    
+    // Label
+    g.setColour(AppColours::textSecondary.withAlpha(0.5f));
+    g.setFont(16.0f);
+    g.drawText(label, area, juce::Justification::centred);
+}
+
+//==============================================================================
+void MainComponent::onConnectionStatusChanged(bool connected)
+{
+    serverConnected = connected;
+    currentStatus = connected ? "Ready" : "Server not running";
+    
+    if (connected && !initialInstrumentsRequested)
+    {
+        if (instrumentBrowser)
+        {
+            DBG("MainComponent: Auto-scanning instruments...");
+            instrumentBrowser->requestInstrumentData();
+        }
+        
+        if (expansionBrowser)
+        {
+            DBG("MainComponent: Auto-scanning expansions...");
+            // Request list first (in case server already scanned)
+            requestExpansionListOSC();
+            // Also trigger a scan of the default expansions directory to be safe
+            // This ensures new files (like the .xpj) are picked up if added while server was off
+            // Use ../expansions because server runs in multimodal-ai-music-gen subdir
+            requestScanExpansionsOSC("../expansions"); 
+        }
+        
+        initialInstrumentsRequested = true;
+    }
+    
+    juce::MessageManager::callAsync([this]()
+    {
+        repaint();
+    });
+}
+
+void MainComponent::onProgress(float percent, const juce::String& step, const juce::String& message)
+{
+    currentProgress = percent;
+    currentStatus = message;
+
+    GenerationProgress progress;
+    progress.progress = percent;
+    progress.stepName = step.isNotEmpty() ? step : message;
+    progress.message = message;
+    appState.notifyGenerationProgress(progress);
+    
+    juce::MessageManager::callAsync([this]()
+    {
+        repaint();
+    });
+}
+
+void MainComponent::onGenerationComplete(const GenerationResult& result)
+{
+    currentProgress = 1.0f;
+    {
+        const bool hasMasteredAudio = result.audioPath.isNotEmpty();
+        juce::File outputFile(hasMasteredAudio
+                                  ? result.audioPath
+                                  : result.midiPath);
+        currentStatus = outputFile.existsAsFile()
+                            ? (juce::String(hasMasteredAudio
+                                                ? "Generated backend mastered reference: "
+                                                : "Generated dry/unmastered MIDI preview/fallback: ")
+                               + outputFile.getFileNameWithoutExtension()
+                               + (hasMasteredAudio ? "" : " (no live FX/mastering)"))
+                            : juce::String(hasMasteredAudio
+                                               ? "Generation complete: backend mastered reference"
+                                               : "Generation complete: dry/unmastered MIDI preview/fallback (no live FX/mastering)");
+    }
+    generationStatus = GenerationStatus::Completed;
+    generationCompleteTime = juce::Time::getCurrentTime();
+    
+        juce::MessageManager::callAsync([this, result]()
+        {
+            // Update app state with output file
+            juce::File outputFile(result.audioPath.isNotEmpty() 
+                ? result.audioPath : result.midiPath);
+            appState.setOutputFile(outputFile);
+        
+        // IMPORTANT: Notify all AppState listeners that generation is complete
+        // This must happen BEFORE setGenerating(false) to ensure proper UI reset
+        appState.notifyGenerationCompleted(outputFile);
+        
+        // Now reset generating state
+        appState.setGenerating(false);
+        
+            // Refresh the visualization panel to show the new file
+            if (visualizationPanel)
+            {
+                if (outputFile.existsAsFile())
+                    visualizationPanel->setOutputDirectory(outputFile.getParentDirectory());
+                visualizationPanel->refreshRecentFiles();
+            }
+        
+        // Load the generated MIDI file for visualization and as an unmastered preview/fallback.
+        if (result.midiPath.isNotEmpty())
+        {
+            juce::File midiFile(result.midiPath);
+            if (midiFile.existsAsFile())
+            {
+                audioEngine.loadMidiFile(midiFile);
+                // Also load into piano roll
+                if (visualizationPanel)
+                {
+                    // Importing a generated MIDI into ProjectState creates note nodes for
+                    // Arrange/Piano Roll. Those ValueTree notifications must not immediately
+                    // re-export a simplified MIDI preview and erase the original program changes
+                    // or clear the backend mastered WAV reference.
+                    suppressProjectMidiSync = true;
+                    visualizationPanel->loadMidiFile(midiFile);
+                    juce::MessageManager::callAsync([this]() {
+                        suppressProjectMidiSync = false;
+                    });
+                }
+
+                applyGeneratedInstrumentSamples(result);
+                applyGeneratedInstrumentPatchSubset(result);
+
+                if (result.audioPath.isEmpty())
+                    currentStatus = "Loaded dry/unmastered MIDI preview/fallback: "
+                                    + midiFile.getFileNameWithoutExtension()
+                                    + " (no live FX/mastering)";
+            }
+        }
+
+        // Prefer the backend-rendered/mastered audio for playback, while keeping MIDI loaded above
+        // for visualization and as a fallback if the audio file cannot be loaded.
+        bool backendMasteredReferenceLoaded = false;
+        if (result.audioPath.isNotEmpty())
+        {
+            juce::File audioFile(result.audioPath);
+            if (audioFile.existsAsFile())
+            {
+                if (audioEngine.loadAudioFile(audioFile))
+                {
+                    backendMasteredReferenceLoaded = true;
+                    juce::String loadedMessage = "Loaded backend mastered reference: "
+                                                 + audioFile.getFileNameWithoutExtension();
+                    juce::StringArray provenance;
+                    const auto renderer = result.rendererPath.trim();
+                    const auto stage = result.orchestralStagePresetResolved.trim();
+                    if (renderer.isNotEmpty())
+                        provenance.add(renderer);
+                    if (stage.isNotEmpty())
+                        provenance.add(juce::String("stage ") + stage);
+                    if (!provenance.isEmpty())
+                        loadedMessage << " · " << provenance.joinIntoString(" · ");
+                    currentStatus = loadedMessage;
+                }
+                else
+                    currentStatus = "Backend mastered reference load failed; using dry/unmastered MIDI preview/fallback (no live FX/mastering)";
+            }
+            else
+            {
+                currentStatus = "Backend mastered reference missing; using dry/unmastered MIDI preview/fallback (no live FX/mastering)";
+            }
+        }
+
+        const auto renderSummary = summarizeRenderReport(result);
+        if (visualizationPanel)
+        {
+            auto playbackMode = backendMasteredReferenceLoaded ? juce::String("Backend mastered reference")
+                                                               : juce::String("Dry MIDI fallback");
+            auto displayedFile = juce::File(backendMasteredReferenceLoaded && result.audioPath.isNotEmpty()
+                                                ? result.audioPath
+                                                : result.midiPath);
+            auto fileName = displayedFile.getFileName();
+            if (fileName.isEmpty())
+                fileName = outputFile.getFileName();
+
+            auto renderer = compactRendererBadgeText(result.rendererPath);
+            if (renderer.isEmpty())
+                renderer = compactRendererBadgeText(summaryValueAfterPrefix(renderSummary, "Renderer:"));
+
+            auto stage = result.orchestralStagePresetResolved.trim();
+            if (stage.isEmpty())
+                stage = result.orchestralStagePreset.trim();
+
+            visualizationPanel->setGenerationResultSummary(playbackMode,
+                                                           fileName,
+                                                           renderer,
+                                                           stage,
+                                                           firstUsefulGenerationDiagnosticLine(renderSummary));
+        }
+        
+        // Pass takes data to TakeLanePanel if available
+        if (result.takesJson.isNotEmpty() && takeLanePanel)
+        {
+            takeLanePanel->setAvailableTakes(result.takesJson);
+            
+            // Auto-show takes panel if we have takes
+            if (takeLanePanel->hasTakes() && !bottomPanelVisible)
+            {
+                showToolWindow(5);  // 5 = Takes
+            }
+        }
+        
+        // Show compact completion summary and lightweight output actions.
+        // Full diagnostics are kept in the persistent Last Generation banner/status.
+        juce::String message = "Generation complete.\n\n";
+        message += "Details are shown in the Last Generation banner.\n";
+        message += "Use the actions below to open or reveal generated files.\n\n";
+        if (result.audioPath.isNotEmpty())
+            message += "Audio: " + juce::File(result.audioPath).getFileName() + "\n";
+        if (result.midiPath.isNotEmpty())
+            message += "MIDI: " + juce::File(result.midiPath).getFileName() + "\n";
+        if (result.duration > 0.0)
+            message += "Duration: " + juce::String(result.duration, 1) + "s\n";
+        if (result.orchestralStagePresetResolved.isNotEmpty())
+            message += "Stage: " + result.orchestralStagePresetResolved + "\n";
+        message += "Recent Files updated.";
+
+        juce::StringArray actions;
+        auto options = juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::InfoIcon)
+            .withTitle("Generation Summary")
+            .withMessage(message);
+
+        if (result.audioPath.isNotEmpty() && juce::File(result.audioPath).existsAsFile())
+        {
+            actions.add("open_audio");
+            options = options.withButton("Open Audio");
+        }
+
+        juce::File revealTarget(result.audioPath.isNotEmpty() ? result.audioPath : result.midiPath);
+        if (revealTarget.existsAsFile())
+        {
+            actions.add("reveal_folder");
+            options = options.withButton("Reveal Folder");
+        }
+
+        if (result.midiPath.isNotEmpty() && juce::File(result.midiPath).existsAsFile())
+        {
+            actions.add("open_midi");
+            options = options.withButton("Open MIDI");
+        }
+
+        actions.add("ok");
+        options = options.withButton("Close");
+
+        juce::AlertWindow::showAsync(options, [actions, result](int buttonIndex)
+        {
+            const int actionIndex = buttonIndex - 1;
+            if (actionIndex < 0 || actionIndex >= actions.size())
+                return;
+
+            const auto action = actions[actionIndex];
+            if (action == "open_audio")
+                juce::File(result.audioPath).startAsProcess();
+            else if (action == "open_midi")
+                juce::File(result.midiPath).startAsProcess();
+            else if (action == "reveal_folder")
+            {
+                juce::File target(result.audioPath.isNotEmpty() ? result.audioPath : result.midiPath);
+                if (target.existsAsFile())
+                    target.revealToUser();
+            }
+        });
+        
+        repaint();
+    });
+}
+
+void MainComponent::onError(int code, const juce::String& message)
+{
+    juce::ignoreUnused(code);
+
+    if (takeRenderPending)
+    {
+        takeRenderPending = false;
+        currentStatus = "Current comp render failed";
+
+        juce::MessageManager::callAsync([this, message]()
+        {
+            if (takeLanePanel)
+                takeLanePanel->setStatusMessage("Current comp render failed: " + message, AppColours::error);
+            repaint();
+        });
+        return;
+    }
+
+    if (expansionResolvePending)
+    {
+        expansionResolvePending = false;
+        currentStatus = "Expansion resolution failed";
+
+        juce::MessageManager::callAsync([this, message]()
+        {
+            if (expansionBrowser)
+                expansionBrowser->showResolutionFailure(message);
+            repaint();
+        });
+        return;
+    }
+
+    currentStatus = "Error: " + message;
+
+    if (!appState.isGenerating())
+    {
+        juce::MessageManager::callAsync([this, message]()
+        {
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::MessageBoxIconType::WarningIcon,
+                "Backend Error",
+                message
+            );
+
+            repaint();
+        });
+        return;
+    }
+
+    generationStatus = GenerationStatus::Error;
+    
+    juce::MessageManager::callAsync([this, message]()
+    {
+        // Notify all AppState listeners about the error first
+        appState.notifyGenerationError(message);
+        
+        // Then reset generating state
+        appState.setGenerating(false);
+        
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon,
+            "Generation Error",
+            message
+        );
+        
+        repaint();
+    });
+}
+
+void MainComponent::onAnalyzeResultReceived(const AnalyzeResult& result)
+{
+    const bool isMasteringReferenceAnalyze = masteringReferenceAnalysisPending;
+    masteringReferenceAnalysisPending = false;
+
+    currentStatus = "Analysis complete";
+    
+    // Store last analysis result for potential apply action
+    lastAnalyzeResult = result;
+
+    // Store the pending reference in AppState for use in generation
+    // The source_url is inside the 'analysis' object in the response
+    juce::String sourceUrl;
+    auto json = juce::JSON::parse(result.rawJson);
+    if (auto* obj = json.getDynamicObject())
+    {
+        // The source_url is inside the 'analysis' object
+        if (auto analysisVar = obj->getProperty("analysis"); analysisVar.isObject())
+        {
+            if (auto* analysisObj = analysisVar.getDynamicObject())
+            {
+                sourceUrl = analysisObj->getProperty("source_url").toString();
+            }
+        }
+        
+        // Fallback: check top-level properties (for backward compatibility)
+        if (sourceUrl.isEmpty())
+            sourceUrl = obj->getProperty("source_path").toString();
+        if (sourceUrl.isEmpty())
+            sourceUrl = obj->getProperty("source_url").toString();
+        if (sourceUrl.isEmpty())
+            sourceUrl = obj->getProperty("path").toString();
+        if (sourceUrl.isEmpty())
+            sourceUrl = obj->getProperty("url").toString();
+    }
+    
+    // Store the analysis result in AppState for inclusion in generation request
+    if (result.success && sourceUrl.isNotEmpty())
+    {
+        juce::String fullKey = result.key;
+        if (result.mode == "minor")
+            fullKey += "m";
+        
+        appState.setPendingReference(
+            sourceUrl,
+            static_cast<int>(result.bpm + 0.5f),
+            fullKey,
+            result.estimatedGenre
+        );
+        
+        DBG("MainComponent: Stored pending reference: " << sourceUrl 
+            << " (" << result.bpm << " BPM, " << fullKey << ", " << result.estimatedGenre << ")");
+    }
+
+    const auto summary = buildAnalyzeSummary(result);
+    const auto detail = buildAnalyzeDetail(result);
+
+    if (isMasteringReferenceAnalyze)
+    {
+        currentStatus = result.success ? "Reference hints ready (not auto-applied)"
+                                       : "Reference analyze failed";
+
+        juce::MessageManager::callAsync([this, result, summary, detail]()
+        {
+            if (masteringSuitePanel)
+            {
+                if (result.success)
+                    masteringSuitePanel->setReferenceAnalysisResult(summary, detail);
+                else
+                    masteringSuitePanel->setReferenceAnalysisFailure("Analyze returned no usable reference hints.");
+            }
+
+            repaint();
+        });
+        return;
+    }
+
+    juce::MessageManager::callAsync([this, result]()
+    {
+        juce::String msg;
+        msg += "Analysis complete!\n\n";
+        if (result.bpm > 0.0f)
+            msg += "BPM: " + juce::String(result.bpm, 1) + " (conf " + juce::String(result.bpmConfidence, 2) + ")\n";
+        if (result.key.isNotEmpty())
+            msg += "Key: " + result.key + " " + result.mode + " (conf " + juce::String(result.keyConfidence, 2) + ")\n";
+        if (result.estimatedGenre.isNotEmpty())
+            msg += "Estimated genre: " + result.estimatedGenre + " (conf " + juce::String(result.genreConfidence, 2) + ")\n";
+        if (result.styleTags.size() > 0)
+            msg += "Style tags: " + result.styleTags.joinIntoString(", ") + "\n";
+        if (result.promptHints.isNotEmpty())
+            msg += "\nPrompt hints: " + result.promptHints;
+        
+        msg += "\n\nWould you like to apply these settings to the current session?";
+        
+        // Use AlertWindow with OK/Cancel to offer Apply action
+        auto* window = new juce::AlertWindow(
+            "Analyze Result",
+            msg,
+            juce::MessageBoxIconType::InfoIcon
+        );
+        
+        window->addButton("Apply", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        window->addButton("Close", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        
+        window->enterModalState(true, juce::ModalCallbackFunction::create([this, result](int buttonClicked)
+        {
+            if (buttonClicked == 1)  // Apply clicked
+            {
+                applyAnalysisResult(result);
+            }
+        }), true);
+
+        repaint();
+    });
+}
+
+void MainComponent::onAnalyzeError(int code, const juce::String& message)
+{
+    const bool isMasteringReferenceAnalyze = masteringReferenceAnalysisPending;
+    masteringReferenceAnalysisPending = false;
+
+    currentStatus = "Analyze error";
+
+    if (isMasteringReferenceAnalyze)
+    {
+        juce::MessageManager::callAsync([this, message]()
+        {
+            if (masteringSuitePanel)
+                masteringSuitePanel->setReferenceAnalysisFailure(message);
+
+            currentStatus = "Reference analyze failed";
+            repaint();
+        });
+        return;
+    }
+
+    juce::MessageManager::callAsync([this, code, message]()
+    {
+        juce::ignoreUnused(code);
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon,
+            "Analyze Error",
+            message
+        );
+        repaint();
+    });
+}
+
+void MainComponent::onSchemaVersionWarning(int clientVersion, int serverVersion, const juce::String& message)
+{
+    juce::ignoreUnused(clientVersion, serverVersion);
+    
+    // Surface schema version warning in status bar (non-blocking)
+    currentStatus = "Warning: " + message;
+    
+    juce::MessageManager::callAsync([this, message]()
+    {
+        // Show a toast-like notification (use AlertWindow for simplicity, but non-modal)
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::MessageBoxIconType::WarningIcon,
+            "Protocol Version Mismatch",
+            message + "\n\nGeneration will proceed with best-effort compatibility."
+        );
+        repaint();
+    });
+}
+
+//==============================================================================
+// PromptPanel::Listener
+void MainComponent::generateRequested(const juce::String& prompt)
+{
+    // Prevent duplicate generation requests
+    if (appState.isGenerating())
+    {
+        DBG("Generation already in progress, ignoring request");
+        return;
+    }
+    
+    if (ensureBackendConnected("Generate"))
+    {
+        GenerationRequest request;
+        request.generateRequestId();
+        request.prompt = prompt;
+        request.genre = currentGenre;  // Pass genre from GenreSelector
+        request.bpm = appState.getBPM();
+        request.bars = appState.getDurationBars();
+        request.numTakes = appState.getNumTakes();
+        request.renderAudio = true;
+
+        auto outputDir = resolveDefaultOutputDir();
+        request.outputDir = outputDir.getFullPathName();
+        appendGenerateLog(outputDir, request.requestId, request.prompt);
+
+        generationStatus = GenerationStatus::RequestSent;
+        generationRequestId = request.requestId;
+        generationTaskId.clear();
+        jsonRpcPollInFlight = false;
+        lastJsonRpcPollMs = 0;
+        jsonRpcMissingResultPolls = 0;
+        generationRequestTime = juce::Time::getCurrentTime();
+        
+        // Include reference URL if an analysis was performed
+        if (appState.hasAnalyzedReference())
+        {
+            request.referenceUrl = appState.getPendingReferenceUrl();
+            DBG("MainComponent: Including reference URL in generation: " << request.referenceUrl);
+        }
+
+        // Apply-once per-request overrides (sent via options)
+        if (nextGenerateOverrides.isObject())
+        {
+            request.options = nextGenerateOverrides;
+
+            // If duration_bars provided, keep the legacy bars field aligned for this request.
+            if (auto* obj = nextGenerateOverrides.getDynamicObject())
+            {
+                if (obj->hasProperty("duration_bars"))
+                    request.bars = (int) obj->getProperty("duration_bars");
+            }
+
+            // Clear after one use
+            nextGenerateOverrides = juce::var();
+            updateControlsNextOverridesUi();
+        }
+        
+        // Collect instrument paths from loaded tracks
+        auto& projectState = appState.getProjectState();
+        auto mixerNode = projectState.getMixerNode();
+        
+        for (const auto& child : mixerNode)
+        {
+            if (child.hasType(Project::IDs::TRACK))
+            {
+                juce::String instrumentPath = child.getProperty(Project::IDs::path).toString();
+                if (instrumentPath.isNotEmpty())
+                {
+                    request.instrumentPaths.add(instrumentPath);
+                    DBG("Adding instrument to generation: " << instrumentPath);
+                }
+            }
+        }
+        
+        // Also get currently selected instrument if any
+        if (instrumentBrowser)
+        {
+            const InstrumentInfo* selected = instrumentBrowser->getSelectedInstrument();
+            if (selected && selected->absolutePath.isNotEmpty())
+            {
+                // Avoid duplicates
+                if (!request.instrumentPaths.contains(selected->absolutePath))
+                {
+                    request.instrumentPaths.add(selected->absolutePath);
+                    DBG("Adding selected instrument to generation: " << selected->absolutePath);
+                }
+            }
+        }
+        
+        oscBridge->sendGenerate(request);
+        appState.setGenerating(true);
+    }
+}
+
+void MainComponent::cancelRequested()
+{
+    if (oscBridge)
+    {
+        oscBridge->sendCancel();
+    }
+    
+    // Notify listeners about the cancellation (treated as an error for UI reset purposes)
+    appState.notifyGenerationError("Cancelled by user");
+    
+    // Reset generating state immediately on user cancel
+    appState.setGenerating(false);
+    currentStatus = "Generation cancelled";
+    generationStatus = GenerationStatus::Cancelled;
+    
+    juce::MessageManager::callAsync([this]()
+    {
+        repaint();
+    });
+}
+
+//==============================================================================
+// VisualizationPanel::Listener
+void MainComponent::fileSelected(const juce::File& file)
+{
+    if (file.hasFileExtension(".wav;.wave;.aiff;.aif;.flac;.mp3;.ogg"))
+        currentStatus = "Loaded audio file/reference: " + file.getFileName();
+    else if (file.hasFileExtension(".mid;.midi"))
+        currentStatus = "Loaded dry/unmastered MIDI preview/fallback: " + file.getFileName()
+                        + " (no live FX/mastering)";
+    else
+        currentStatus = "Loaded: " + file.getFileName();
+    
+    // Note: VisualizationPanel already handles loading MIDI files into piano roll
+    // We just update the status here
+    
+    juce::MessageManager::callAsync([this]()
+    {
+        repaint();
+    });
+}
+
+void MainComponent::analyzeFileRequested(const juce::File& file)
+{
+    masteringReferenceAnalysisPending = false;
+
+    if (!ensureBackendConnected("Analyze"))
+        return;
+
+    currentStatus = "Analyzing: " + file.getFileName();
+    oscBridge->sendAnalyzeFile(file, false);
+    repaint();
+}
+
+void MainComponent::onGenerationAcknowledged(const juce::String& requestId, const juce::String& taskId)
+{
+    if (generationRequestId.isNotEmpty() && requestId.isNotEmpty() && requestId != generationRequestId)
+        return;
+
+    generationStatus = GenerationStatus::Acknowledged;
+    generationAckTime = juce::Time::getCurrentTime();
+    if (taskId.isNotEmpty())
+        generationTaskId = taskId;
+    repaint();
+}
+
+void MainComponent::regenerateRequested(int startBar, int endBar, const juce::StringArray& tracks)
+{
+    DBG("MainComponent: Regenerate requested bars " << startBar << "-" << endBar);
+
+    if (!ensureBackendConnected("Regenerate"))
+        return;
+
+    {
+        RegenerationRequest request;
+        request.generateRequestId();
+        request.startBar = startBar;
+        request.endBar = endBar;
+        request.tracks = tracks;
+        request.seedStrategy = "new";
+        
+        // Get current context from app state
+        request.bpm = appState.getBPM();
+        request.key = appState.getKey();
+        request.genre = currentGenre;
+
+        // Apply-once per-request overrides (merged into options)
+        if (nextRegenerateOverrides.isObject())
+        {
+            request.extraOptions = nextRegenerateOverrides;
+            nextRegenerateOverrides = juce::var();
+            updateControlsNextOverridesUi();
+        }
+        
+        oscBridge->sendRegenerate(request);
+        
+        currentStatus = "Regenerating bars " + juce::String(startBar) + "-" + juce::String(endBar) + "...";
+        repaint();
+    }
+}
+
+void MainComponent::controlsApplyNextRequestRequested(const juce::var& overrides, ControlsPanel::NextScope scope)
+{
+    if (scope == ControlsPanel::NextScope::GenerateOnly)
+    {
+        nextGenerateOverrides = overrides;
+    }
+    else if (scope == ControlsPanel::NextScope::RegenerateOnly)
+    {
+        nextRegenerateOverrides = overrides;
+    }
+    else
+    {
+        nextGenerateOverrides = overrides;
+        nextRegenerateOverrides = overrides;
+    }
+
+    updateControlsNextOverridesUi();
+    currentStatus = "Armed overrides for next request";
+    repaint();
+}
+
+void MainComponent::controlsClearNextRequestRequested()
+{
+    nextGenerateOverrides = juce::var();
+    nextRegenerateOverrides = juce::var();
+
+    updateControlsNextOverridesUi();
+    currentStatus = "Cleared next-request overrides";
+    repaint();
+}
+
+void MainComponent::updateControlsNextOverridesUi()
+{
+    if (!controlsWindow)
+        return;
+
+    if (auto* panel = controlsWindow->getControlsPanel())
+    {
+        const bool gen = nextGenerateOverrides.isObject();
+        const bool regen = nextRegenerateOverrides.isObject();
+        panel->setNextOverridesIndicator(gen, regen);
+    }
+}
+
+//==============================================================================
+// MasteringSuitePanel::Listener implementation
+void MainComponent::masteringSettingsChanged(MasteringSuitePanel* /*panel*/)
+{
+    // Handle mastering UI-only settings changes
+    currentStatus = "Mastering UI settings changed locally only; no backend apply path is wired and live preview stays dry/unmastered";
+    repaint();
+}
+
+void MainComponent::applyMasteringRequested(const juce::String& processorType, const juce::var& settings)
+{
+    DBG("Mastering process requested: " << processorType << " with settings: " << juce::JSON::toString(settings));
+
+    juce::ignoreUnused(processorType, settings);
+
+    currentStatus = "Mastering apply unavailable: no backend action is wired and live preview stays dry/unmastered";
+    repaint();
+}
+
+void MainComponent::analyzeReferenceRequested(const juce::File& file)
+{
+    masteringReferenceAnalysisPending = false;
+
+    if (!ensureBackendConnected("Analyze reference"))
+    {
+        if (masteringSuitePanel)
+            masteringSuitePanel->setReferenceAnalysisFailure("Backend unavailable. Reference Analyze needs the server connection.");
+        return;
+    }
+    
+    DBG("Reference analysis requested for: " << file.getFullPathName());
+
+    masteringReferenceAnalysisPending = true;
+    if (masteringSuitePanel)
+        masteringSuitePanel->setReferenceAnalysisPending(file.getFileName());
+
+    currentStatus = "Analyzing reference hints: " + file.getFileName();
+    oscBridge->sendAnalyzeFile(file, false);
+    repaint();
+}
+
+void MainComponent::separateStemsRequested(const juce::File& file)
+{
+    DBG("Stem separation requested for: " << file.getFullPathName());
+
+    juce::ignoreUnused(file);
+
+    currentStatus = "Stem separation unavailable: no backend action is wired yet";
+    repaint();
+}
+
+void MainComponent::trackInstrumentSelected(int trackIndex, const juce::String& instrumentId)
+{
+    DBG("MainComponent: Track " << trackIndex << " instrument selected: " << instrumentId);
+
+    if (isGeneratedMidiProgramInstrumentId(instrumentId))
+    {
+        auto trackNode = appState.getProjectState().getTrackNode(trackIndex);
+        const auto gmName = trackNode.isValid()
+            ? trackNode.getProperty(Project::IDs::midiInstrumentName).toString()
+            : juce::String();
+        currentStatus = gmName.isNotEmpty()
+            ? ("Generated MIDI instrument: " + gmName + " (backend WAV remains reference)")
+            : "Generated MIDI instrument retained (backend WAV remains reference)";
+        repaint();
+        return;
+    }
+    
+    // Load the instrument for this track
+    if (isSampleInstrumentId(instrumentId))
+    {
+        auto sampleFile = sampleFileFromInstrumentId(instrumentId);
+        if (!sampleFile.existsAsFile())
+        {
+            DBG("MainComponent: Sample instrument missing: " << sampleFile.getFullPathName());
+            return;
+        }
+
+        currentStatus = "Loading sample...";
+        repaint();
+
+        juce::Thread::launch([this, trackIndex, sampleFile]() {
+            audioEngine.loadInstrument(trackIndex, sampleFile, sampleFile.getFileNameWithoutExtension());
+
+            juce::MessageManager::callAsync([this, name = sampleFile.getFileNameWithoutExtension()]() {
+                currentStatus = "Ready (" + name + ")";
+                repaint();
+            });
+        });
+    }
+    else if (instrumentId == "default_sine")
+    {
+        // Reset to simple sine synth (quick operation, no async needed)
+        audioEngine.loadTrackInstrument(trackIndex, "");
+
+        // Apply persisted Default Synth settings immediately (so playback matches without selecting tracks).
+        applyDefaultSynthSettingsForTrackFromProjectState(trackIndex);
+    }
+    else
+    {
+        // Show loading status
+        currentStatus = "Loading instrument...";
+        repaint();
+        
+        // Load instrument asynchronously to avoid blocking UI
+        juce::Thread::launch([this, trackIndex, instrumentId]() {
+            bool success = audioEngine.loadTrackInstrument(trackIndex, instrumentId);
+            
+            // Update UI on message thread
+            juce::MessageManager::callAsync([this, success, instrumentId]() {
+                if (success)
+                {
+                    currentStatus = "Ready";
+                }
+                else
+                {
+                    currentStatus = "Failed to load instrument";
+                    DBG("Failed to load instrument: " << instrumentId);
+                }
+                repaint();
+            });
+        });
+    }
+}
+
+void MainComponent::trackLoadSF2Requested(int trackIndex)
+{
+    DBG("MainComponent: Track " << trackIndex << " load SF2 requested");
+    
+    auto fileChooser = std::make_shared<juce::FileChooser>(
+        "Load SoundFont (SF2)",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory),
+        "*.sf2"
+    );
+    
+    fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [this, trackIndex, fileChooser](const juce::FileChooser& chooser) {
+            auto result = chooser.getResult();
+            if (result.existsAsFile())
+            {
+                currentStatus = "Loading SF2...";
+                repaint();
+                
+                // Load SF2 on background thread
+                juce::Thread::launch([this, trackIndex, file = result]() {
+                    if (auto* track = audioEngine.getTrack(trackIndex))
+                    {
+                        bool success = track->loadSF2(file);
+                        
+                        juce::MessageManager::callAsync([this, success, fileName = file.getFileName()]() {
+                            if (success)
+                            {
+                                currentStatus = "Loaded: " + fileName;
+                            }
+                            else
+                            {
+                                currentStatus = "Failed to load SF2";
+                            }
+                            repaint();
+                        });
+                    }
+                });
+            }
+        });
+}
+
+void MainComponent::trackLoadSFZRequested(int trackIndex)
+{
+    DBG("MainComponent: Track " << trackIndex << " load SFZ requested");
+    
+    auto fileChooser = std::make_shared<juce::FileChooser>(
+        "Load SFZ Instrument",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory),
+        "*.sfz"
+    );
+    
+    fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [this, trackIndex, fileChooser](const juce::FileChooser& chooser) {
+            auto result = chooser.getResult();
+            if (result.existsAsFile())
+            {
+                currentStatus = "Loading SFZ...";
+                repaint();
+                
+                // Load SFZ on background thread
+                juce::Thread::launch([this, trackIndex, file = result]() {
+                    if (auto* track = audioEngine.getTrack(trackIndex))
+                    {
+                        bool success = track->loadSFZ(file);
+                        
+                        juce::MessageManager::callAsync([this, success, fileName = file.getFileName()]() {
+                            if (success)
+                            {
+                                currentStatus = "Loaded: " + fileName;
+                            }
+                            else
+                            {
+                                currentStatus = "Failed to load SFZ";
+                            }
+                            repaint();
+                        });
+                    }
+                });
+            }
+        });
+}
+
+void MainComponent::analyzeUrlRequested(const juce::String& url)
+{
+    masteringReferenceAnalysisPending = false;
+
+    if (!ensureBackendConnected("Analyze URL"))
+        return;
+
+    currentStatus = "Analyzing URL...";
+    oscBridge->sendAnalyzeUrl(url, false);
+    repaint();
+}
+
+//==============================================================================
+// GenreSelector::Listener
+void MainComponent::genreChanged(const juce::String& genreId, const GenreTemplate& genre)
+{
+    DBG("Genre changed to: " + genreId);
+    applyGenreTheme(genreId);
+    
+    // Update app state BPM based on genre template
+    int midBpm = (genre.bpmMin + genre.bpmMax) / 2;
+    appState.setBPM(midBpm);
+    
+    currentStatus = "Genre: " + genre.displayName;
+    repaint();
+}
+
+//==============================================================================
+// InstrumentBrowserPanel::Listener
+void MainComponent::instrumentChosen(const InstrumentInfo& info)
+{
+    DBG("Instrument chosen: " + info.name + " (" + info.category + ")");
+    currentStatus = "Selected: " + info.name;
+    
+    juce::File sampleFile(info.absolutePath);
+    if (sampleFile.existsAsFile())
+    {
+        int trackIndex = 0;
+        if (mixerComponent)
+            trackIndex = mixerComponent->getSelectedTrackIndex();
+            
+        audioEngine.loadInstrument(trackIndex, sampleFile, info.name);
+        currentStatus = "Loaded " + info.name + " to Track " + juce::String(trackIndex + 1);
+        
+        // Update ProjectState to reflect the change in the mixer
+        auto trackNode = appState.getProjectState().getTrackNode(trackIndex);
+        if (trackNode.isValid())
+        {
+            trackNode.setProperty(Project::IDs::name, info.name, nullptr);
+            // Also store the path for persistence
+            trackNode.setProperty(Project::IDs::path, info.absolutePath, nullptr);
+        }
+    }
+    else
+    {
+        currentStatus = "File not found: " + info.filename;
+    }
+    
+    repaint();
+}
+
+void MainComponent::onInstrumentsLoaded(const juce::String& json)
+{
+    DBG("MainComponent: Instruments loaded from server");
+    const auto libraryDropdownItems = buildLibraryDropdownItemsFromCatalog(json);
+
+    if (visualizationPanel)
+        visualizationPanel->setAdditionalInstrumentMenuItems(libraryDropdownItems);
+
+    if (instrumentBrowser)
+    {
+        instrumentBrowser->loadFromJSON(json);
+        currentStatus = libraryDropdownItems.empty()
+            ? "Instrument library loaded"
+            : "Instrument library loaded (" + juce::String((int)libraryDropdownItems.size()) + " track dropdown choices)";
+        repaint();
+    }
+}
+
+void MainComponent::requestLibraryInstruments()
+{
+    if (!ensureBackendConnected("Request instruments"))
+        return;
+
+    {
+        DBG("MainComponent: Requesting library instruments");
+
+        auto findInstrumentsDirectory = []() -> juce::File {
+            juce::Array<juce::File> startPoints;
+            startPoints.add(juce::File::getCurrentWorkingDirectory());
+            startPoints.add(juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory());
+
+            for (auto start : startPoints)
+            {
+                auto dir = start;
+                for (int depth = 0; depth < 10 && dir.exists(); ++depth)
+                {
+                    auto instrumentsDir = dir.getChildFile("instruments");
+                    if (instrumentsDir.isDirectory())
+                        return instrumentsDir;
+                    dir = dir.getParentDirectory();
+                }
+            }
+            return {};
+        };
+
+        juce::StringArray paths;
+        if (auto instrumentsDir = findInstrumentsDirectory(); instrumentsDir.isDirectory())
+            paths.add(instrumentsDir.getFullPathName());
+
+        // If we couldn't resolve a stable absolute path, fall back to the server-side defaults.
+        // (Server will error if it has no configured defaults.)
+        oscBridge->sendGetInstruments(paths);
+    }
+}
+
+//==============================================================================
+// FXChainPanel::Listener
+void MainComponent::fxChainChanged(FXChainPanel* panel)
+{
+    if (panel == nullptr) return;
+    
+    DBG("FX chain updated");
+    currentStatus = "FX chain updated for backend render parity only; live MIDI preview stays dry/unmastered";
+    
+    // Apply FX chain to real-time MixerGraph
+    auto& mixerGraph = audioEngine.getMixerGraph();
+    
+    // Get chains for each bus and apply to MixerGraph
+    juce::StringArray buses = { "master", "drums", "bass", "melodic" };
+    for (const auto& bus : buses)
+    {
+        auto chain = panel->getChainForBus(bus);
+        
+        // Convert to JSON var for MixerGraph
+        juce::Array<juce::var> chainArray;
+        for (const auto& fx : chain)
+        {
+            chainArray.add(fx.toJSON());
+        }
+        
+        mixerGraph.setFXChainForBus(bus, juce::var(chainArray));
+    }
+    
+    // Also send to Python backend for offline render parity
+    if (oscBridge && oscBridge->isConnected())
+    {
+        auto fxJson = panel->toJSON();
+        oscBridge->sendFXChain(fxJson);
+        DBG("FX chain sent to server");
+    }
+    
+    repaint();
+}
+
+//==============================================================================
+// ExpansionBrowserPanel::Listener
+void MainComponent::requestExpansionListOSC()
+{
+    if (!ensureBackendConnected("Request expansion list"))
+        return;
+
+    DBG("MainComponent: Requesting expansion list");
+    oscBridge->sendExpansionList();
+}
+
+void MainComponent::requestInstrumentsOSC(const juce::String& expansionId)
+{
+    if (!ensureBackendConnected("Request expansion instruments"))
+        return;
+
+    DBG("MainComponent: Requesting instruments for expansion: " + expansionId);
+    oscBridge->sendExpansionInstruments(expansionId);
+}
+
+void MainComponent::requestResolveOSC(const juce::String& instrument, const juce::String& genre)
+{
+    expansionResolvePending = false;
+
+    if (!ensureBackendConnected("Resolve expansion instrument"))
+        return;
+
+    DBG("MainComponent: Resolving instrument: " + instrument + " for genre: " + genre);
+
+    expansionResolvePending = true;
+    if (expansionBrowser)
+        expansionBrowser->showResolutionPending(instrument, genre);
+
+    currentStatus = "Resolving expansion instrument: " + instrument;
+    oscBridge->sendExpansionResolve(instrument, genre);
+}
+
+void MainComponent::requestImportExpansionOSC(const juce::String& path)
+{
+    if (!ensureBackendConnected("Import expansion"))
+        return;
+
+    DBG("MainComponent: Importing expansion from: " + path);
+    oscBridge->sendExpansionImport(path);
+
+    // Refresh list after import
+    juce::Timer::callAfterDelay(1000, [this]() {
+        requestExpansionListOSC();
+    });
+}
+
+void MainComponent::requestScanExpansionsOSC(const juce::String& directory)
+{
+    if (!ensureBackendConnected("Scan expansions"))
+        return;
+
+    DBG("MainComponent: Scanning expansions in: " + directory);
+    oscBridge->sendExpansionScan(directory);
+
+    // Refresh list after scan
+    juce::Timer::callAfterDelay(2000, [this]() {
+        requestExpansionListOSC();
+    });
+}
+
+void MainComponent::requestExpansionEnableOSC(const juce::String& expansionId, bool enabled)
+{
+    if (!ensureBackendConnected("Enable/disable expansion"))
+        return;
+
+    DBG("MainComponent: Setting expansion " + expansionId + " enabled=" + (enabled ? "true" : "false"));
+    oscBridge->sendExpansionEnable(expansionId, enabled);
+
+    // Refresh expansion list to get updated state
+    juce::Timer::callAfterDelay(500, [this]() {
+        requestExpansionListOSC();
+    });
+}
+
+//==============================================================================
+// OSCBridge::Listener expansion callbacks
+void MainComponent::onExpansionListReceived(const juce::String& json)
+{
+    DBG("MainComponent: Received expansion list");
+    
+    juce::MessageManager::callAsync([this, json]() {
+        if (expansionBrowser)
+            expansionBrowser->loadExpansionsFromJSON(json);
+    });
+}
+
+void MainComponent::onExpansionInstrumentsReceived(const juce::String& json)
+{
+    DBG("MainComponent: Received expansion instruments");
+    
+    juce::MessageManager::callAsync([this, json]() {
+        if (expansionBrowser)
+            expansionBrowser->loadInstrumentsFromJSON(json);
+    });
+}
+
+void MainComponent::onExpansionResolveReceived(const juce::String& json)
+{
+    DBG("MainComponent: Received resolution result");
+    expansionResolvePending = false;
+    
+    juce::MessageManager::callAsync([this, json]() {
+        auto parsed = juce::JSON::parse(json);
+        auto result = ResolvedInstrumentInfo::fromJSON(parsed);
+
+        if (expansionBrowser)
+            expansionBrowser->showResolutionResult(json);
+
+        if (result.path.isEmpty())
+            currentStatus = "Expansion resolve: no match found";
+        else if (isResolutionFallbackLike(result))
+            currentStatus = "Expansion resolve: fallback/default suggestion returned";
+        else
+            currentStatus = "Expansion resolve: matched " + result.name;
+
+        repaint();
+    });
+}
+
+//==============================================================================
+// OSCBridge::Listener take callbacks
+void MainComponent::onTakesAvailable(const juce::String& json)
+{
+    DBG("MainComponent: Received takes available");
+    
+    juce::MessageManager::callAsync([this, json]() {
+        if (takeLanePanel)
+        {
+            takeLanePanel->setAvailableTakes(json);
+            takeLanePanel->setStatusMessage("Takes ready. Select one take per track to shape the local comp.", AppColours::textSecondary);
+            
+            // Auto-show the takes panel when takes become available
+            if (takeLanePanel->hasTakes() && !bottomPanelVisible)
+            {
+                showToolWindow(5);  // 5 = Takes
+            }
+        }
+    });
+}
+
+void MainComponent::onTakeSelected(const juce::String& track, const juce::String& takeId)
+{
+    DBG("MainComponent: Take selected - " << track << " / " << takeId);
+    
+    juce::MessageManager::callAsync([this, track, takeId]() {
+        if (takeLanePanel)
+        {
+            takeLanePanel->confirmTakeSelection(track, takeId);
+            takeLanePanel->setStatusMessage("Current comp selection confirmed: " + track + " / " + takeId,
+                                            AppColours::success);
+        }
+        
+        currentStatus = "Current comp selection confirmed: " + track + " / " + takeId;
+        repaint();
+    });
+}
+
+void MainComponent::onTakeRendered(const juce::String& track, const juce::String& outputPath)
+{
+    DBG("MainComponent: Take rendered - " << track << " -> " << outputPath);
+    takeRenderPending = false;
+    
+    juce::MessageManager::callAsync([this, track, outputPath]() {
+        // Load the rendered audio
+        juce::File audioFile(outputPath);
+        if (audioFile.existsAsFile())
+        {
+            audioEngine.loadAudioFile(audioFile);
+
+            if (takeLanePanel)
+            {
+                takeLanePanel->setStatusMessage("Current comp render ready: " + audioFile.getFileName(),
+                                                AppColours::success);
+            }
+
+            currentStatus = "Current comp render ready: " + audioFile.getFileName();
+        }
+        else
+        {
+            if (takeLanePanel)
+                takeLanePanel->setStatusMessage("Current comp render reported, but output file was not found.", AppColours::warning);
+
+            currentStatus = "Current comp render reported without an output file";
+        }
+
+        repaint();
+    });
+}
+
+//==============================================================================
+// TakeLanePanel::Listener implementation
+void MainComponent::takeSelected(const juce::String& track, const juce::String& takeId, const juce::String& midiPath)
+{
+    DBG("MainComponent: User selected take - " << track << " / " << takeId << " (" << midiPath << ")");
+
+    const bool applied = applyTakeCompToProject(track, takeId, midiPath);
+
+    // Ensure playback updates immediately (don't rely on async ValueTree callbacks).
+    if (applied)
+    {
+        auto midi = appState.getProjectState().exportToMidiFile();
+        audioEngine.loadMidiData(midi);
+        hasAuditionBackupMidi = false; // selection becomes the new "main" state
+    }
+
+    // Send selection to server via OSC (for persistence / future render comp)
+    if (oscBridge)
+        oscBridge->sendSelectTake(track, takeId);
+
+    currentStatus = applied
+        ? ("Local comp updated: " + track + " / " + takeId)
+        : ("Selected take for local comp: " + track + " / " + takeId);
+
+    if (takeLanePanel)
+    {
+        takeLanePanel->setStatusMessage(applied
+                                            ? ("Local comp updated: " + track + " / " + takeId)
+                                            : ("Selected take for local comp: " + track + " / " + takeId),
+                                        applied ? AppColours::primary : AppColours::warning);
+    }
+    repaint();
+}
+
+void MainComponent::takePlayRequested(const juce::String& track, const juce::String& takeId, const juce::String& midiPath)
+{
+    DBG("MainComponent: User requested take playback - " << track << " / " << takeId << " (" << midiPath << ")");
+
+    // Audition should not modify the main project state/visualization. Back up the current
+    // project MIDI so we can restore after the audition.
+    auditionBackupMidi = appState.getProjectState().exportToMidiFile();
+    hasAuditionBackupMidi = true;
+
+    juce::File midiFile(midiPath);
+    if (!midiFile.existsAsFile())
+    {
+        // Try to resolve relative paths against common roots.
+        auto cwdCandidate = juce::File::getCurrentWorkingDirectory().getChildFile(midiPath);
+        if (cwdCandidate.existsAsFile())
+            midiFile = cwdCandidate;
+        else
+        {
+            auto exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+            auto exeCandidate = exeDir.getChildFile(midiPath);
+            if (exeCandidate.existsAsFile())
+                midiFile = exeCandidate;
+        }
+    }
+
+    if (!midiFile.existsAsFile())
+    {
+        currentStatus = "Take MIDI not found: " + track + " / " + takeId;
+        repaint();
+        return;
+    }
+
+    if (audioEngine.loadMidiFile(midiFile))
+    {
+        audioEngine.play();
+        currentStatus = "Auditioning take: " + track + " / " + takeId;
+    }
+    else
+    {
+        currentStatus = "Failed to load take MIDI: " + midiFile.getFileName();
+    }
+
+    repaint();
+}
+
+void MainComponent::takeStopRequested(const juce::String& track)
+{
+    juce::ignoreUnused(track);
+    audioEngine.stop();
+
+    // Restore main project playback MIDI after audition.
+    if (hasAuditionBackupMidi)
+    {
+        audioEngine.loadMidiData(auditionBackupMidi);
+        hasAuditionBackupMidi = false;
+    }
+
+    currentStatus = "Audition stopped";
+    repaint();
+}
+
+void MainComponent::renderTakesRequested()
+{
+    DBG("MainComponent: User requested render of selected takes");
+
+    takeRenderPending = false;
+
+    if (!ensureBackendConnected("Render current comp"))
+    {
+        if (takeLanePanel)
+            takeLanePanel->setStatusMessage("Backend unavailable: Render Current Comp needs the server connection.",
+                                            AppColours::warning);
+        return;
+    }
+    
+    if (oscBridge)
+    {
+        // Build render request from selected takes in each track
+        TakeRenderRequest request;
+        request.generateRequestId();
+        request.useComp = true;  // Render the current comp
+        
+        // Output path in project output directory
+        auto outputDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+            .getParentDirectory().getParentDirectory().getParentDirectory()
+            .getParentDirectory().getChildFile("output");
+        request.outputPath = outputDir.getFullPathName();
+        
+        oscBridge->sendRenderTake(request);
+        takeRenderPending = true;
+        
+        if (takeLanePanel)
+            takeLanePanel->setStatusMessage("Queued backend render of the current comp arrangement...", AppColours::warning);
+
+        currentStatus = "Rendering current comp arrangement...";
+        repaint();
+    }
+    else if (takeLanePanel)
+    {
+        takeLanePanel->setStatusMessage("Backend unavailable: no render transport is connected.", AppColours::warning);
+    }
+}
+
+void MainComponent::commitCompRequested()
+{
+    takeCompSnapshots.clear();
+    currentStatus = "Local comp state committed";
+    if (takeLanePanel)
+        takeLanePanel->setStatusMessage("Local comp state committed.", AppColours::success);
+    repaint();
+}
+
+void MainComponent::revertCompRequested()
+{
+    auto& projectState = appState.getProjectState();
+    for (auto& kv : takeCompSnapshots)
+        projectState.restoreNotesForTrack(kv.first, kv.second);
+
+    takeCompSnapshots.clear();
+    currentStatus = "Local comp state reverted";
+    if (takeLanePanel)
+        takeLanePanel->setStatusMessage("Reverted to the previous local comp state.", AppColours::warning);
+    repaint();
+}
+
+int MainComponent::resolveTrackIndexForName(const juce::String& trackName)
+{
+    const auto nameLower = trackName.trim().toLowerCase();
+
+    auto mixerNode = appState.getProjectState().getMixerNode();
+    if (mixerNode.isValid())
+    {
+        for (auto child : mixerNode)
+        {
+            if (!child.hasType(Project::IDs::TRACK))
+                continue;
+            auto n = child.getProperty(Project::IDs::name).toString().trim().toLowerCase();
+            if (n.isNotEmpty() && n == nameLower)
+                return (int)child.getProperty(Project::IDs::index);
+        }
+    }
+
+    // Common fallbacks
+    if (nameLower == "drums" || nameLower == "drum") return 0;
+    if (nameLower == "bass" || nameLower == "808") return 1;
+    if (nameLower == "chords" || nameLower == "keys") return 2;
+    if (nameLower == "melody" || nameLower == "lead") return 3;
+
+    return -1;
+}
+
+juce::File MainComponent::resolveTakeMidiFile(const juce::String& midiPath) const
+{
+    juce::File midiFile(midiPath);
+    if (midiFile.existsAsFile())
+        return midiFile;
+
+    auto cwdCandidate = juce::File::getCurrentWorkingDirectory().getChildFile(midiPath);
+    if (cwdCandidate.existsAsFile())
+        return cwdCandidate;
+
+    auto exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    auto exeCandidate = exeDir.getChildFile(midiPath);
+    if (exeCandidate.existsAsFile())
+        return exeCandidate;
+
+    return juce::File();
+}
+
+bool MainComponent::applyTakeCompToProject(const juce::String& track, const juce::String& takeId, const juce::String& midiPath)
+{
+    juce::ignoreUnused(takeId);
+
+    const int trackIndex = resolveTrackIndexForName(track);
+    if (trackIndex < 0)
+        return false;
+
+    auto midiFile = resolveTakeMidiFile(midiPath);
+    if (!midiFile.existsAsFile())
+        return false;
+
+    auto& projectState = appState.getProjectState();
+    if (takeCompSnapshots.find(trackIndex) == takeCompSnapshots.end())
+        takeCompSnapshots[trackIndex] = projectState.copyNotesForTrack(trackIndex);
+
+    return projectState.replaceNotesForTrackFromMidiFile(trackIndex, midiFile);
+}
+
+//==============================================================================
+// ProjectState::Listener overrides
+void MainComponent::valueTreePropertyChanged(juce::ValueTree& tree, const juce::Identifier& property)
+{
+    if (tree.hasType(Project::IDs::TRACK))
+    {
+        int index = tree.getProperty(Project::IDs::index);
+        if (auto* track = audioEngine.getTrack(index))
+        {
+            if (property == Project::IDs::volume)
+                track->setVolume(tree.getProperty(property));
+            else if (property == Project::IDs::mute)
+                track->setMute(tree.getProperty(property));
+            else if (property == Project::IDs::solo)
+                track->setSolo(tree.getProperty(property));
+        }
+    }
+    else if (tree.hasType(Project::IDs::NOTE))
+    {
+        // Note changed (moved, resized)
+        juce::MessageManager::callAsync([this]() {
+            if (suppressProjectMidiSync)
+                return;
+            if (audioEngine.hasAudioFileLoaded())
+                return;
+
+            auto midi = appState.getProjectState().exportToMidiFile();
+            audioEngine.loadMidiData(midi);
+        });
+    }
+}
+
+void MainComponent::valueTreeChildAdded(juce::ValueTree& parent, juce::ValueTree& child)
+{
+    if (child.hasType(Project::IDs::NOTE))
+    {
+        juce::MessageManager::callAsync([this]() {
+            if (suppressProjectMidiSync)
+                return;
+            if (audioEngine.hasAudioFileLoaded())
+                return;
+
+            auto midi = appState.getProjectState().exportToMidiFile();
+            audioEngine.loadMidiData(midi);
+        });
+    }
+}
+
+void MainComponent::valueTreeChildRemoved(juce::ValueTree& parent, juce::ValueTree& child, int index)
+{
+    if (child.hasType(Project::IDs::NOTE))
+    {
+        juce::MessageManager::callAsync([this]() {
+            if (suppressProjectMidiSync)
+                return;
+            if (audioEngine.hasAudioFileLoaded())
+                return;
+
+            auto midi = appState.getProjectState().exportToMidiFile();
+            audioEngine.loadMidiData(midi);
+        });
+    }
+}
+
+//==============================================================================
+// TimelineComponent::Listener
+void MainComponent::timelineSeekRequested(double positionSeconds)
+{
+    audioEngine.setPlaybackPosition(positionSeconds);
+}
+
+void MainComponent::loopRegionChanged(double startSeconds, double endSeconds)
+{
+    // Sync loop region to PianoRoll via VisualizationPanel
+    if (visualizationPanel)
+    {
+        if (startSeconds >= 0 && endSeconds > startSeconds)
+            visualizationPanel->setLoopRegion(startSeconds, endSeconds);
+        else
+            visualizationPanel->clearLoopRegion();
+    }
+    
+    DBG("MainComponent: Loop region changed: " << startSeconds << " - " << endSeconds);
+}
+
+//==============================================================================
+void MainComponent::startPythonServer()
+{
+    if (pythonManager && !pythonManager->isRunning())
+    {
+        DBG("MainComponent: Attempting to auto-start Python server...");
+        
+        // Try to start the server on port 9000 (OSC receive port)
+        bool started = pythonManager->startServer({}, {}, 9000, true);  // verbose=true
+        
+        if (started)
+        {
+            DBG("MainComponent: Python server started successfully");
+            currentStatus = "Server starting...";
+        }
+        else
+        {
+            DBG("MainComponent: Could not auto-start Python server");
+            currentStatus = "Server not found - start manually with: python main.py --server";
+        }
+    }
+}
+
+void MainComponent::stopPythonServer()
+{
+    // Send graceful shutdown via OSC first
+    if (oscBridge && oscBridge->isConnected())
+    {
+        DBG("MainComponent: Sending shutdown command to Python server...");
+        oscBridge->sendShutdown();
+        
+        // Give the server a moment to process the shutdown
+        juce::Thread::sleep(500);
+    }
+    
+    // Then stop the managed process
+    if (pythonManager)
+    {
+        DBG("MainComponent: Stopping Python server process...");
+        pythonManager->stopServer();
+    }
+}
+
+void MainComponent::pollJsonRpcStatus()
+{
+    if (generationTaskId.isEmpty() || generationStatus == GenerationStatus::Completed
+        || generationStatus == GenerationStatus::Error || generationStatus == GenerationStatus::Cancelled)
+        return;
+
+    jsonRpcPollInFlight = true;
+    lastJsonRpcPollMs = juce::Time::currentTimeMillis();
+
+    const auto taskId = generationTaskId;
+
+    std::thread([this, taskId]()
+    {
+        juce::String responseText;
+        juce::var responseJson;
+        juce::String errorText;
+
+        try
+        {
+            const juce::URL baseUrl("http://127.0.0.1:8765");
+
+            juce::DynamicObject::Ptr req = new juce::DynamicObject();
+            req->setProperty("jsonrpc", "2.0");
+            req->setProperty("id", 1);
+            req->setProperty("method", "get_status");
+
+            juce::DynamicObject::Ptr params = new juce::DynamicObject();
+            params->setProperty("task_id", taskId);
+            req->setProperty("params", juce::var(params.get()));
+
+            const auto postData = juce::JSON::toString(juce::var(req.get()), false);
+            const auto url = baseUrl.withPOSTData(postData);
+
+            auto options = juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inPostData)
+                               .withHttpRequestCmd("POST")
+                               .withExtraHeaders("Content-Type: application/json\r\n")
+                               .withConnectionTimeoutMs(jsonRpcTimeoutMs)
+                               .withNumRedirectsToFollow(0);
+
+            if (auto stream = std::unique_ptr<juce::InputStream>(url.createInputStream(options)))
+            {
+                responseText = stream->readEntireStreamAsString();
+                responseJson = juce::JSON::parse(responseText);
+            }
+            else
+            {
+                errorText = "No response (connection failed)";
+            }
+        }
+        catch (const std::exception& e)
+        {
+            errorText = "Exception: " + juce::String(e.what());
+        }
+        catch (...)
+        {
+            errorText = "Unknown exception";
+        }
+
+        juce::MessageManager::callAsync([this, taskId, responseJson, responseText, errorText]()
+        {
+            jsonRpcPollInFlight = false;
+
+            // If the user started a new generation, ignore stale polls.
+            if (taskId != generationTaskId)
+                return;
+
+            if (errorText.isNotEmpty())
+                return;
+
+            if (!responseJson.isObject())
+                return;
+
+            auto* top = responseJson.getDynamicObject();
+            if (!top)
+                return;
+
+            auto resultVar = top->getProperty("result");
+            if (!resultVar.isObject())
+                return;
+
+            auto* statusObj = resultVar.getDynamicObject();
+            if (!statusObj)
+                return;
+
+            const bool found = (bool) statusObj->getProperty("found");
+            if (!found)
+                return;
+
+            // Progress (optional)
+            if (auto progressVar = statusObj->getProperty("progress"); progressVar.isObject())
+            {
+                if (auto* progObj = progressVar.getDynamicObject())
+                {
+                    const float percent = (float) progObj->getProperty("percent");
+                    const juce::String step = progObj->getProperty("step").toString();
+                    const juce::String message = progObj->getProperty("message").toString();
+                    if (message.isNotEmpty() || step.isNotEmpty())
+                        onProgress(percent, step, message.isNotEmpty() ? message : step);
+                }
+            }
+
+            const juce::String status = statusObj->getProperty("status").toString().toLowerCase();
+            if (status == "completed" || status == "failed" || status == "cancelled")
+            {
+                // If we didn't receive an OSC /complete, synthesize completion from JSON-RPC.
+                if (auto resVar = statusObj->getProperty("result"); resVar.isObject())
+                {
+                    const auto resJsonStr = juce::JSON::toString(resVar, true);
+                    const auto genResult = GenerationResult::fromJson(resJsonStr);
+
+                    // Stop polling before dispatching completion UI.
+                    generationTaskId.clear();
+
+                    if (genResult.success)
+                        onGenerationComplete(genResult);
+                    else
+                        onError(genResult.errorCode != 0 ? genResult.errorCode : 201,
+                                genResult.errorMessage.isNotEmpty() ? genResult.errorMessage
+                                                                   : ("Generation " + status));
+                    jsonRpcMissingResultPolls = 0;
+                }
+                else
+                {
+                    jsonRpcMissingResultPolls += 1;
+                    currentStatus = "Finalizing result...";
+                    if (jsonRpcMissingResultPolls >= 5)
+                    {
+                        generationTaskId.clear();
+                        onError(201, "Backend reported completion but no result payload was returned");
+                        jsonRpcMissingResultPolls = 0;
+                    }
+                }
+            }
+        });
+    }).detach();
+}
+
+//==============================================================================
+void MainComponent::timerCallback()
+{
+    // Delayed OSC setup on first timer call
+    static bool expansionsScanned = false;
+    
+    if (!oscBridge)
+    {
+        setupOSCConnection();
+        
+        // Scan local expansions after OSC is set up
+        if (!expansionsScanned)
+        {
+            scanLocalExpansions();
+            expansionsScanned = true;
+        }
+        return;
+    }
+    
+    // Scan expansions if not done yet
+    if (!expansionsScanned)
+    {
+        scanLocalExpansions();
+        expansionsScanned = true;
+    }
+    
+    // Periodic health check
+    if (!oscBridge->isConnected())
+    {
+        // Try to reconnect
+        oscBridge->connect();
+    }
+
+    // JSON-RPC polling fallback for generation observability.
+    // This fixes "hung" UX when OSC /progress or /complete is missed but the backend is still working.
+    if ((generationStatus == GenerationStatus::RequestSent || generationStatus == GenerationStatus::Acknowledged)
+        && generationTaskId.isNotEmpty())
+    {
+        const auto nowMs = juce::Time::currentTimeMillis();
+        if (!jsonRpcPollInFlight && (lastJsonRpcPollMs == 0 || nowMs - lastJsonRpcPollMs >= jsonRpcPollIntervalMs))
+            pollJsonRpcStatus();
+    }
+}
+
+//==============================================================================
+bool MainComponent::keyPressed(const juce::KeyPress& key)
+{
+    // ==========================================================================
+    // Skip global shortcuts if a TextEditor has keyboard focus
+    // This allows normal text editing (paste, cut, copy, etc.)
+    // ==========================================================================
+    auto* focusedComponent = juce::Component::getCurrentlyFocusedComponent();
+    if (dynamic_cast<juce::TextEditor*>(focusedComponent) != nullptr)
+    {
+        // Let text editing keys pass through to TextEditor
+        // Only handle Escape to unfocus
+        if (key.isKeyCode(juce::KeyPress::escapeKey))
+        {
+            focusedComponent->giveAwayKeyboardFocus();
+            currentStatus = "Exited text input";
+            return true;
+        }
+        // Don't consume any other keys - let TextEditor handle them
+        return false;
+    }
+    
+    // ==========================================================================
+    // Transport Controls (DAW-standard shortcuts)
+    // ==========================================================================
+    
+    // Space: Toggle Play/Pause
+    if (key.isKeyCode(juce::KeyPress::spaceKey))
+    {
+        if (audioEngine.isPlaying())
+            audioEngine.pause();
+        else
+            audioEngine.play();
+
+        if (audioEngine.isPlaying())
+        {
+            if (audioEngine.hasAudioFileLoaded())
+                currentStatus = "Playing loaded audio file/reference";
+            else if (audioEngine.hasMidiLoaded())
+                currentStatus = "Playing dry/unmastered MIDI preview (no live FX/mastering)";
+            else
+                currentStatus = "Playing";
+        }
+        else
+        {
+            if (audioEngine.hasAudioFileLoaded())
+                currentStatus = "Paused loaded audio file/reference";
+            else if (audioEngine.hasMidiLoaded())
+                currentStatus = "Paused dry/unmastered MIDI preview (no live FX/mastering)";
+            else
+                currentStatus = "Paused";
+        }
+        return true;
+    }
+    
+    // Home: Return to start (position 0)
+    if (key.isKeyCode(juce::KeyPress::homeKey))
+    {
+        if (key.getModifiers().isShiftDown() && timelineComponent && timelineComponent->hasLoopRegion())
+        {
+            // Shift+Home: Go to loop start
+            audioEngine.setPlaybackPosition(timelineComponent->getLoopRegionStart());
+            currentStatus = "At loop start";
+        }
+        else
+        {
+            // Home: Go to start
+            audioEngine.setPlaybackPosition(0.0);
+            currentStatus = "At start";
+        }
+        return true;
+    }
+    
+    // End: Go to end of track
+    if (key.isKeyCode(juce::KeyPress::endKey))
+    {
+        if (key.getModifiers().isShiftDown() && timelineComponent && timelineComponent->hasLoopRegion())
+        {
+            // Shift+End: Go to loop end
+            audioEngine.setPlaybackPosition(timelineComponent->getLoopRegionEnd());
+            currentStatus = "At loop end";
+        }
+        else
+        {
+            // End: Go to end
+            double duration = audioEngine.getTotalDuration();
+            if (duration > 0)
+            {
+                audioEngine.setPlaybackPosition(duration);
+                currentStatus = "At end";
+            }
+        }
+        return true;
+    }
+    
+    // L: Toggle loop on/off
+    if (key.isKeyCode('l') && !key.getModifiers().isCommandDown())
+    {
+        bool currentLooping = audioEngine.isLooping();
+        audioEngine.setLooping(!currentLooping);
+        currentStatus = audioEngine.isLooping() ? "Loop ON" : "Loop OFF";
+        return true;
+    }
+    
+    // Delete/Backspace on loop region: Clear loop
+    if ((key.isKeyCode(juce::KeyPress::deleteKey) || key.isKeyCode(juce::KeyPress::backspaceKey))
+        && timelineComponent && timelineComponent->hasLoopRegion())
+    {
+        timelineComponent->clearLoopRegion();
+        currentStatus = "Loop region cleared";
+        return true;
+    }
+    
+    // ==========================================================================
+    // Navigation (Bar/Beat Skipping)
+    // ==========================================================================
+    
+    // Arrow keys for navigation
+    if (key.isKeyCode(juce::KeyPress::leftKey) || key.isKeyCode(juce::KeyPress::rightKey))
+    {
+        double currentPos = audioEngine.getPlaybackPosition();
+        int bpm = appState.getBPM();
+        double secondsPerBeat = 60.0 / bpm;
+        double secondsPerBar = secondsPerBeat * 4.0;  // Assume 4/4 time
+        
+        double skipAmount;
+        juce::String skipType;
+        
+        if (key.getModifiers().isShiftDown())
+        {
+            // Shift+Arrow: Fine control (1 beat)
+            skipAmount = secondsPerBeat;
+            skipType = "beat";
+        }
+        else if (key.getModifiers().isCommandDown())
+        {
+            // Ctrl+Arrow: Skip 4 bars
+            skipAmount = secondsPerBar * 4.0;
+            skipType = "4 bars";
+        }
+        else
+        {
+            // Arrow: Skip 1 bar
+            skipAmount = secondsPerBar;
+            skipType = "bar";
+        }
+        
+        double newPos;
+        if (key.isKeyCode(juce::KeyPress::rightKey))
+        {
+            newPos = juce::jmin(currentPos + skipAmount, audioEngine.getTotalDuration());
+            currentStatus = "Skip forward " + skipType;
+        }
+        else
+        {
+            newPos = juce::jmax(currentPos - skipAmount, 0.0);
+            currentStatus = "Skip back " + skipType;
+        }
+        
+        audioEngine.setPlaybackPosition(newPos);
+        return true;
+    }
+    
+    // ==========================================================================
+    // Undo/Redo (Standard shortcuts)
+    // ==========================================================================
+    
+    // Undo: Ctrl+Z (or Cmd+Z on Mac)
+    if (key.isKeyCode('z') && key.getModifiers().isCommandDown())
+    {
+        if (key.getModifiers().isShiftDown())
+        {
+            // Redo: Ctrl+Shift+Z
+            appState.getProjectState().redo();
+            currentStatus = "Redo";
+        }
+        else
+        {
+            // Undo: Ctrl+Z
+            appState.getProjectState().undo();
+            currentStatus = "Undo";
+        }
+        repaint();
+        return true;
+    }
+    
+    // Redo: Ctrl+Y (Windows standard)
+    if (key.isKeyCode('y') && key.getModifiers().isCommandDown())
+    {
+        appState.getProjectState().redo();
+        currentStatus = "Redo";
+        repaint();
+        return true;
+    }
+    
+    // ==========================================================================
+    // Quick Generation (G key)
+    // ==========================================================================
+    
+    // G: Focus prompt panel (for quick generation)
+    if (key.isKeyCode('g') && !key.getModifiers().isCommandDown() && !key.getModifiers().isAltDown())
+    {
+        if (promptPanel)
+        {
+            // This would focus the prompt input - requires grabKeyboardFocus on the TextEditor
+            // For now, just indicate the intent
+            currentStatus = "Press Enter in prompt to generate";
+        }
+        return true;
+    }
+    
+    // Escape: Stop playback or cancel generation
+    if (key.isKeyCode(juce::KeyPress::escapeKey))
+    {
+        if (audioEngine.isPlaying())
+        {
+            audioEngine.stop();
+            currentStatus = "Stopped";
+        }
+        return true;
+    }
+    
+    return false;
+}

@@ -1,0 +1,3682 @@
+#!/usr/bin/env python3
+"""
+Multimodal AI Music Generator - CLI Entry Point
+
+Generate complete music tracks from natural language prompts.
+
+Usage:
+    python main.py "dark trap soul at 87 BPM in C minor"
+    python main.py "lofi hip hop chill beat" --bpm 75 --key Am
+    python main.py "aggressive 808 trap" --mpc --stems --output ./my_beat
+    python main.py --reference "https://youtu.be/..." "make something like this"
+
+Features:
+    - Natural language prompt parsing
+    - Reference track analysis (YouTube URLs)
+    - MIDI generation with professional humanization
+    - Audio rendering (FluidSynth or procedural fallback)
+    - MPC Software .xpj export for hardware integration
+    - Stem export for mixing flexibility
+"""
+
+import argparse
+import contextlib
+import sys
+import os
+import shutil
+import re
+import copy
+import traceback
+from enum import Enum
+from pathlib import Path
+from datetime import datetime, timezone
+import json
+import random
+import numpy as np
+from typing import Any, Callable, Optional, Sequence
+
+# Keep CLI/JSON outputs clean if pygame is imported indirectly
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from multimodal_gen import (
+    PromptParser,
+    ParsedPrompt,
+    MidiGenerator,
+    AudioRenderer,
+    MpcExporter,
+    Arranger,
+    AssetsGenerator,
+    TICKS_PER_BEAT,
+    # New modules
+    SessionGraphBuilder,
+    validate_generation,
+    repair_violations,
+    TakeGenerator,
+    # Instrument resolution service
+    create_instrument_service,
+    validate_score_plan,
+    score_plan_to_parsed_prompt,
+    score_plan_to_performance_score,
+    extract_seed,
+    extract_mastering_overrides,
+    ScorePlanError,
+)
+from multimodal_gen.instrument_patch import (
+    build_track_scoped_instrument_patches,
+    enrich_instrument_patches_with_resolved_samples,
+)
+from multimodal_gen.prompt_parser import set_instrument_service
+from multimodal_gen.arranger import Arrangement
+
+# Import StylePolicy for coherent producer decisions
+try:
+    from multimodal_gen.style_policy import StylePolicy, compile_policy, PolicyContext, ArrangementDensity
+    HAS_STYLE_POLICY = True
+except ImportError:
+    HAS_STYLE_POLICY = False
+    StylePolicy = None
+    compile_policy = None
+    PolicyContext = None
+
+# Comprehensive quality validation (Sprint 7)
+try:
+    from multimodal_gen.quality_validator import QualityValidator
+    _HAS_QUALITY_VALIDATOR = True
+except ImportError:
+    _HAS_QUALITY_VALIDATOR = False
+
+# File analysis for post-generation diagnostics (Sprint 7.5)
+try:
+    from multimodal_gen.file_analysis import analyze_path as file_analyze_path
+    _HAS_FILE_ANALYSIS = True
+except ImportError:
+    _HAS_FILE_ANALYSIS = False
+
+# Stem separation capability (Sprint 7.5 — dormant, used for discoverability)
+try:
+    from multimodal_gen.stem_separation import separate_stems, check_separation_backends
+    _HAS_STEM_SEPARATION = True
+except ImportError:
+    _HAS_STEM_SEPARATION = False
+
+# Import agent-based generation system (optional)
+try:
+    from multimodal_gen.agents import (
+        OfflineConductor,
+        MasenqoAgent,
+        WashintAgent,
+        KrarAgent,
+        BegenaAgent,
+        KeberoAgent,
+    )
+    HAS_AGENT_SYSTEM = True
+except ImportError:
+    HAS_AGENT_SYSTEM = False
+    OfflineConductor = None
+
+try:
+    from colorama import init, Fore, Style
+    init()
+    HAS_COLORAMA = True
+except ImportError:
+    HAS_COLORAMA = False
+    class Fore:
+        GREEN = YELLOW = RED = CYAN = MAGENTA = BLUE = WHITE = ""
+    class Style:
+        BRIGHT = RESET_ALL = ""
+
+
+def _supports_unicode_output() -> bool:
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    return "utf" in enc
+
+
+def print_banner():
+    """Print application banner."""
+    banner_unicode = """
+╔════════════════════════════════════════════════════════════════╗
+║           🎵 MULTIMODAL AI MUSIC GENERATOR 🎵                 ║
+║                                                                ║
+║      Text -> MIDI -> Audio -> MPC Project                     ║
+║      Professional Humanization • CPU-Only • Offline-First     ║
+╚════════════════════════════════════════════════════════════════╝
+    """
+    banner_ascii = """
+=================================================================
+  MULTIMODAL AI MUSIC GENERATOR
+
+  Text -> MIDI -> Audio -> MPC Project
+  Professional Humanization • CPU-Only • Offline-First
+=================================================================
+    """
+    banner = banner_unicode if _supports_unicode_output() else banner_ascii
+    try:
+        print(f"{Fore.CYAN}{banner}{Style.RESET_ALL}")
+    except Exception:
+        # Fallback for redirected output or colorama issues
+        print(banner)
+
+
+def print_step(step: str, message: str):
+    """Print a step indicator."""
+    print(f"{Fore.GREEN}[{step}]{Style.RESET_ALL} {message}")
+
+
+def print_info(message: str):
+    """Print info message."""
+    try:
+        print(f"{Fore.CYAN}ℹ{Style.RESET_ALL}  {message}")
+    except UnicodeEncodeError:
+        print(f"{Fore.CYAN}[i]{Style.RESET_ALL}  {message}")
+
+
+def print_warning(message: str):
+    """Print warning message."""
+    try:
+        print(f"{Fore.YELLOW}⚠{Style.RESET_ALL}  {message}")
+    except UnicodeEncodeError:
+        print(f"{Fore.YELLOW}[!]{Style.RESET_ALL}  {message}")
+
+
+def print_error(message: str):
+    """Print error message."""
+    try:
+        print(f"{Fore.RED}✗{Style.RESET_ALL}  {message}")
+    except UnicodeEncodeError:
+        print(f"{Fore.RED}[x]{Style.RESET_ALL}  {message}")
+
+
+def print_success(message: str):
+    """Print success message."""
+    try:
+        print(f"{Fore.GREEN}✓{Style.RESET_ALL}  {message}")
+    except UnicodeEncodeError:
+        print(f"{Fore.GREEN}[v]{Style.RESET_ALL}  {message}")
+
+
+def _json_progress_to_stderr(enabled: bool):
+    """Keep machine-readable stdout clean by routing progress prints to stderr in JSON mode."""
+    return contextlib.redirect_stdout(sys.stderr) if enabled else contextlib.nullcontext()
+
+
+def _build_json_export_view(value: Any, *, omit_private_keys: bool = False) -> Any:
+    """Create a JSON-safe export view without mutating live in-memory objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, Enum):
+        return _build_json_export_view(value.value, omit_private_keys=omit_private_keys)
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+
+    if isinstance(value, np.generic):
+        return _build_json_export_view(value.item(), omit_private_keys=omit_private_keys)
+
+    if isinstance(value, dict):
+        export_dict = {}
+        for key, item in value.items():
+            if omit_private_keys and isinstance(key, str) and key.startswith("_"):
+                continue
+            export_dict[str(key)] = _build_json_export_view(item, omit_private_keys=omit_private_keys)
+        return export_dict
+
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _build_json_export_view(item, omit_private_keys=omit_private_keys)
+            for item in value
+        ]
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _build_json_export_view(to_dict(), omit_private_keys=omit_private_keys)
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def _get_render_failure_details(render_report: Optional[dict]) -> Optional[dict]:
+    """Extract the failure section from a render report if present."""
+    if not isinstance(render_report, dict):
+        return None
+
+    render_status = render_report.get("render_status")
+    if not isinstance(render_status, dict):
+        return None
+
+    failure = render_status.get("failure")
+    return failure if isinstance(failure, dict) else None
+
+
+def _prompt_requests_ethiopian_mp3_reference_profiles(prompt: str) -> bool:
+    """Detect explicit prompt opt-in for MP3-source Ethiopian instrument profiles."""
+    normalized = str(prompt or "").strip().lower()
+    normalized_space = normalized.replace("-", " ").replace("_", " ")
+    phrases = (
+        "mp3 variant",
+        "mp3 reference",
+        "mp3 source",
+        "source truth instruments",
+        "user mp3",
+    )
+    return any(phrase in normalized or phrase in normalized_space for phrase in phrases)
+
+
+# Ethiopian-family genres that default to the MP3-variant (real-recording) instruments.
+_ETHIOPIAN_SAMPLE_GENRES = {
+    "ethiopian",
+    "ethiopian_traditional",
+    "eskista",
+    "ethio_jazz",
+}
+
+# Ethiopian instruments that have an extracted real-recording sample bank.
+_ETHIOPIAN_SAMPLE_INSTRUMENTS = {"krar", "masenqo", "begena"}
+
+
+def _prompt_disables_ethiopian_mp3_samples(prompt: str) -> bool:
+    """Detect an explicit opt-out from the default MP3-variant Ethiopian instruments."""
+    normalized = str(prompt or "").strip().lower()
+    normalized_space = normalized.replace("-", " ").replace("_", " ")
+    phrases = (
+        "no mp3 samples",
+        "no mp3 sample",
+        "no mp3 variant",
+        "disable mp3 samples",
+        "disable mp3 sample",
+        "without mp3 samples",
+        "procedural ethiopian",
+    )
+    return any(phrase in normalized or phrase in normalized_space for phrase in phrases)
+
+
+def _prefer_ethiopian_samples_for_generation(
+    parsed_genre: Optional[str],
+    parsed_instruments: Optional[Sequence[str]],
+    prompt: str,
+) -> bool:
+    """Decide whether the workflow should prefer MP3-variant Ethiopian instruments.
+
+    Defaults ON for Ethiopian-family genres (and when Ethiopian sampled
+    instruments are explicitly requested) so the workflow prefers the user's
+    real-recording instruments without requiring a magic phrase. An explicit
+    opt-out phrase ('no mp3 samples', etc.) forces it back OFF.
+    """
+    if _prompt_disables_ethiopian_mp3_samples(prompt):
+        return False
+    try:
+        from multimodal_gen.utils import normalize_genre
+        genre_key = normalize_genre(parsed_genre)
+    except Exception:
+        genre_key = str(parsed_genre or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if genre_key in _ETHIOPIAN_SAMPLE_GENRES:
+        return True
+    requested = {str(inst).strip().lower() for inst in (parsed_instruments or [])}
+    return bool(requested & _ETHIOPIAN_SAMPLE_INSTRUMENTS)
+
+
+
+def _write_render_error_artifact(
+    error_path: Path,
+    render_report: Optional[dict] = None,
+    error: Optional[BaseException] = None,
+) -> bool:
+    """Persist a human-readable render failure summary for troubleshooting."""
+    failure = _get_render_failure_details(render_report)
+    render_status = render_report.get("render_status") if isinstance(render_report, dict) else {}
+    current_stage = render_status.get("current_stage") if isinstance(render_status, dict) else None
+    warnings = render_report.get("warnings") if isinstance(render_report, dict) else None
+
+    lines = [
+        "MUSE render diagnostics",
+        f"generated_at: {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}",
+    ]
+
+    if isinstance(render_report, dict):
+        if render_report.get("renderer_path") is not None:
+            lines.append(f"renderer_path: {render_report.get('renderer_path')}")
+        if render_report.get("midi_path"):
+            lines.append(f"midi_path: {render_report.get('midi_path')}")
+        if render_report.get("output_path"):
+            lines.append(f"output_path: {render_report.get('output_path')}")
+
+    if failure:
+        lines.append(f"failure_reason: {failure.get('reason')}")
+        failure_stage = failure.get("stage") or current_stage
+        if failure_stage:
+            lines.append(f"failure_stage: {failure_stage}")
+        if failure.get("exception_type"):
+            lines.append(f"exception_type: {failure.get('exception_type')}")
+        if failure.get("exception_message"):
+            lines.append(f"exception_message: {failure.get('exception_message')}")
+    elif current_stage:
+        lines.append(f"failure_stage: {current_stage}")
+
+    if warnings:
+        lines.append("")
+        lines.append("warnings:")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+
+    report_traceback = failure.get("traceback") if failure else None
+    error_traceback = None
+    if error is not None:
+        lines.append("")
+        lines.append(f"unhandled_exception: {type(error).__name__}: {error}")
+        error_traceback = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+    trace_text = report_traceback or error_traceback
+    if trace_text:
+        lines.append("")
+        lines.append("traceback:")
+        lines.append(trace_text.rstrip())
+
+    try:
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        error_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _persist_render_diagnostics(
+    renderer,
+    output_dir: Path,
+    project_name: str,
+    *,
+    render_success: Optional[bool] = None,
+    error: Optional[BaseException] = None,
+) -> dict:
+    """Persist render diagnostics artifacts when available."""
+    artifacts = {}
+    render_report = None
+
+    if renderer is not None:
+        try:
+            if hasattr(renderer, "get_last_render_report"):
+                render_report = renderer.get_last_render_report()
+            else:
+                render_report = getattr(renderer, "_last_render_report", None)
+        except Exception:
+            render_report = getattr(renderer, "_last_render_report", None)
+
+        try:
+            render_report_path = output_dir / f"{project_name}_render_report.json"
+            if hasattr(renderer, "write_last_render_report") and renderer.write_last_render_report(str(render_report_path)):
+                artifacts["render_report"] = str(render_report_path)
+        except Exception:
+            pass
+
+    should_write_error = error is not None or render_success is False
+    if not should_write_error and isinstance(render_report, dict):
+        render_status = render_report.get("render_status")
+        if isinstance(render_status, dict):
+            should_write_error = not bool(render_status.get("success", True))
+
+    if should_write_error:
+        error_path = output_dir / f"{project_name}_render_error.txt"
+        if _write_render_error_artifact(error_path, render_report=render_report, error=error):
+            artifacts["render_error"] = str(error_path)
+
+    return artifacts
+
+
+def _render_status_failed_from_results(results: dict) -> bool:
+    """Return True when a persisted render report explicitly marks render failure."""
+    if not isinstance(results, dict):
+        return False
+
+    render_report_path = results.get("render_report")
+    if not render_report_path:
+        return False
+
+    try:
+        render_report = json.loads(Path(render_report_path).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    render_status = render_report.get("render_status") if isinstance(render_report, dict) else None
+    return isinstance(render_status, dict) and render_status.get("success") is False
+
+
+def _require_audio_failed(results: dict) -> bool:
+    """Strict smoke/CI audio gate: require an audio artifact and successful render status."""
+    return not bool(results.get("audio")) or _render_status_failed_from_results(results)
+
+
+def check_ffmpeg() -> bool:
+    """Check if ffmpeg is available for YouTube audio extraction.
+    
+    Returns:
+        True if ffmpeg is found, False otherwise.
+    """
+    if shutil.which('ffmpeg') is None:
+        print_warning("FFmpeg not found in PATH")
+        print_info("   YouTube reference analysis may not work")
+        print_info("   Install: winget install ffmpeg (Windows) or brew install ffmpeg (Mac)")
+        return False
+    return True
+
+
+def extract_youtube_url(text: str) -> Optional[str]:
+    """Extract YouTube URL from text if present.
+    
+    Supports both youtube.com/watch and youtu.be formats.
+    
+    Args:
+        text: Text that may contain a YouTube URL
+        
+    Returns:
+        Extracted YouTube URL or None if not found
+    """
+    pattern = r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)'
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
+
+
+def print_parsed_prompt(parsed: ParsedPrompt, reference_info: dict = None):
+    """Print parsed prompt details."""
+    try:
+        print(f"\n{Fore.MAGENTA}{'─' * 50}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}📝 Parsed Prompt:{Style.RESET_ALL}")
+    except UnicodeEncodeError:
+        print(f"\n{Fore.MAGENTA}{'-' * 50}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}Parsed Prompt:{Style.RESET_ALL}")
+        
+    print(f"   BPM: {parsed.bpm}")
+    print(f"   Key: {parsed.key} {parsed.scale_type.name.lower()}")
+    print(f"   Genre: {parsed.genre}")
+    if parsed.style_modifiers:
+        print(f"   Style: {', '.join(parsed.style_modifiers)}")
+    if parsed.sonic_adjectives:
+        print(f"   Sonic: {', '.join(parsed.sonic_adjectives)}")
+    if parsed.instruments:
+        print(f"   Instruments: {', '.join(parsed.instruments)}")
+    if parsed.drum_elements:
+        print(f"   Drums: {', '.join(parsed.drum_elements)}")
+    if parsed.textures:
+        print(f"   Textures: {', '.join(parsed.textures)}")
+    if parsed.mood:
+        print(f"   Mood: {parsed.mood}")
+    if parsed.energy:
+        print(f"   Energy: {parsed.energy}")
+    
+    # Show reference analysis if available
+    if reference_info:
+        try:
+            print(f"\n{Fore.BLUE}🎵 Reference Analysis:{Style.RESET_ALL}")
+        except UnicodeEncodeError:
+            print(f"\n{Fore.BLUE}Reference Analysis:{Style.RESET_ALL}")
+            
+        if reference_info.get("title"):
+            print(f"   Source: {reference_info['title']}")
+        if reference_info.get("detected_bpm"):
+            print(f"   Detected BPM: {reference_info['detected_bpm']:.1f}")
+        if reference_info.get("detected_key"):
+            print(f"   Detected Key: {reference_info['detected_key']}")
+        if reference_info.get("detected_genre"):
+            print(f"   Detected Genre: {reference_info['detected_genre']}")
+        if reference_info.get("style_hints"):
+            print(f"   Style Hints: {reference_info['style_hints']}")
+    
+    try:
+        print(f"{Fore.MAGENTA}{'─' * 50}{Style.RESET_ALL}\n")
+    except UnicodeEncodeError:
+        print(f"{Fore.MAGENTA}{'-' * 50}{Style.RESET_ALL}\n")
+
+
+def ensure_output_dir(output_dir: Path) -> Path:
+    """Ensure output directory exists."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _run_quality_gate(midi_file, arrangement, verbose=False):
+    """Run critic checks on generated MIDI (Sprint 5).
+
+    Returns dict with 'passed' (bool), 'scores' (dict), 'summary' (str).
+    """
+    # Extract chord voicings (channel 2 simultaneous notes)
+    voicings = []
+    for track in midi_file.tracks:
+        name = (getattr(track, 'name', '') or '').lower()
+        if name == 'chords':
+            current_tick = 0
+            active = {}
+            for msg in track:
+                current_tick += msg.time
+                if msg.type == 'note_on' and msg.velocity > 0 and msg.channel == 2:
+                    active[msg.note] = current_tick
+                elif msg.type in ('note_off', 'note_on') and msg.channel == 2:
+                    if hasattr(msg, 'note') and msg.note in active:
+                        del active[msg.note]
+                # Group notes at same tick as a voicing
+                if msg.time > 0 and active:
+                    voicings.append(sorted(active.keys()))
+
+    # Extract bass notes (channel 1)
+    bass_notes = []
+    kick_ticks = []
+    for track in midi_file.tracks:
+        name = (getattr(track, 'name', '') or '').lower()
+        if 'bass' in name or name == '808':
+            current_tick = 0
+            for msg in track:
+                current_tick += msg.time
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    bass_notes.append({'tick': current_tick, 'pitch': msg.note, 'velocity': msg.velocity})
+        if name == 'drums':
+            current_tick = 0
+            for msg in track:
+                current_tick += msg.time
+                if msg.type == 'note_on' and msg.velocity > 0 and msg.note == 36:  # kick
+                    kick_ticks.append(current_tick)
+
+    from multimodal_gen.intelligence.critics import compute_vlc, compute_bkas, compute_adc
+
+    scores = {}
+    passed = True
+    issues = []
+
+    # VLC — Voice Leading Cost
+    if len(voicings) >= 2:
+        vlc_result = compute_vlc(voicings)
+        scores['vlc'] = vlc_result.value
+        if not vlc_result.passed:
+            passed = False
+            issues.append(f"VLC={vlc_result.value:.1f} (>{vlc_result.threshold})")
+        elif verbose:
+            print(f"  [\u2713] VLC: {vlc_result.value:.1f}")
+
+    # BKAS — Bass-Kick Alignment
+    if bass_notes and kick_ticks:
+        bkas_result = compute_bkas(
+            bass_notes=bass_notes,
+            kick_ticks=kick_ticks,
+            tolerance_ticks=48  # ~50ms at 480 tpq
+        )
+        scores['bkas'] = bkas_result.value
+        if not bkas_result.passed:
+            passed = False
+            issues.append(f"BKAS={bkas_result.value:.2f} (<{bkas_result.threshold})")
+        elif verbose:
+            print(f"  [\u2713] BKAS: {bkas_result.value:.2f}")
+
+    # ADC — Arrangement Density Curve
+    if arrangement and hasattr(arrangement, 'get_tension_curve'):
+        try:
+            tension = arrangement.get_tension_curve()
+            if tension:
+                tpb = midi_file.ticks_per_beat
+                total_ticks = sum(msg.time for track in midi_file.tracks for msg in track)
+                total_bars = max(1, total_ticks // (tpb * 4))
+
+                # Count note_ons per bar
+                note_counts = [0] * total_bars
+                for track in midi_file.tracks:
+                    tick = 0
+                    for msg in track:
+                        tick += msg.time
+                        if msg.type == 'note_on' and msg.velocity > 0:
+                            bar = min(tick // (tpb * 4), total_bars - 1)
+                            note_counts[bar] += 1
+
+                density = [float(c) for c in note_counts]
+                adc_result = compute_adc(tension[:len(density)], density)
+                scores['adc'] = adc_result.value
+                if not adc_result.passed:
+                    issues.append(f"ADC={adc_result.value:.2f} (<{adc_result.threshold})")
+                elif verbose:
+                    print(f"  [\u2713] ADC: {adc_result.value:.2f}")
+        except Exception:
+            pass
+
+    summary = "PASSED" if passed else f"Issues: {', '.join(issues)}"
+    return {'passed': passed, 'scores': scores, 'summary': summary}
+
+
+def generate_project_name(parsed: ParsedPrompt) -> str:
+    """Generate a project name from parsed prompt."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    genre = parsed.genre.replace(" ", "_")
+    key = parsed.key.replace("#", "sharp").replace("b", "flat")
+    scale = parsed.scale_type.name.lower()
+    return f"{genre}_{parsed.bpm}bpm_{key}{scale}_{timestamp}"
+
+
+# Type alias for progress callback: (step: str, percent: float, message: str) -> None
+from typing import Callable, Optional
+
+ProgressCallback = Callable[[str, float, str], None]
+
+
+_ETHIOPIAN_AGENT_TRACK_DEFAULTS = {
+    "kebero": {"agent_name": "Kebero", "channel": 9, "program": 0},
+    "drums": {"agent_name": "Drums", "channel": 9, "program": 0},
+    "krar": {"agent_name": "Krar", "channel": 2, "program": 110},
+    "washint": {"agent_name": "Washint", "channel": 3, "program": 112},
+    "masenqo": {"agent_name": "Masenqo", "channel": 4, "program": 111},
+    "begena": {"agent_name": "Begena", "channel": 5, "program": 113},
+    "bass": {"agent_name": "Bass", "channel": 1, "program": 38},
+}
+
+
+def _normalize_agent_track_key(track_name: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(track_name or "").strip().lower())
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return ""
+    if "kebero" in normalized or "atamo" in normalized:
+        return "kebero"
+    if "drum" in normalized:
+        return "drums"
+    if "krar" in normalized:
+        return "krar"
+    if "washint" in normalized:
+        return "washint"
+    if "masenqo" in normalized:
+        return "masenqo"
+    if "begena" in normalized:
+        return "begena"
+    if "bass" in normalized:
+        return "bass"
+    return normalized.replace(" ", "_")
+
+
+def _get_agent_track_defaults(track_name: Any) -> dict[str, Any]:
+    normalized_key = _normalize_agent_track_key(track_name)
+    defaults = dict(_ETHIOPIAN_AGENT_TRACK_DEFAULTS.get(normalized_key, {}))
+    display_name = defaults.get("agent_name") or str(track_name or "Agent").strip() or "Agent"
+    defaults.setdefault("agent_name", display_name)
+    defaults.setdefault("channel", 0)
+    defaults.setdefault("program", 0)
+    return defaults
+
+
+def _extract_nondefault_agent_note_channel(note: Any) -> Optional[int]:
+    candidate = None
+    if isinstance(note, dict):
+        candidate = note.get("channel")
+    else:
+        candidate = getattr(note, "channel", None)
+    try:
+        value = int(candidate)
+    except (TypeError, ValueError):
+        return None
+    return value if value != 0 else None
+
+
+def _normalize_agent_performances(agent_performances: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+
+    if isinstance(agent_performances, dict):
+        for track_name, notes in agent_performances.items():
+            defaults = _get_agent_track_defaults(track_name)
+            note_list = list(notes or [])
+            preserved_channel = next(
+                (
+                    channel
+                    for channel in (
+                        _extract_nondefault_agent_note_channel(note) for note in note_list
+                    )
+                    if channel is not None
+                ),
+                None,
+            )
+            normalized.append(
+                {
+                    "agent_name": defaults["agent_name"],
+                    "notes": note_list,
+                    "channel": preserved_channel if preserved_channel is not None else defaults["channel"],
+                    "program": defaults["program"],
+                }
+            )
+        return normalized
+
+    if isinstance(agent_performances, list):
+        for perf in agent_performances:
+            if not isinstance(perf, dict):
+                continue
+            agent_name = perf.get("agent_name") or perf.get("track_name") or "Agent"
+            defaults = _get_agent_track_defaults(agent_name)
+            normalized.append(
+                {
+                    "agent_name": agent_name,
+                    "notes": list(perf.get("notes") or []),
+                    "channel": perf.get("channel", defaults["channel"]),
+                    "program": perf.get("program", defaults["program"]),
+                }
+            )
+    return normalized
+
+
+def _extract_agent_note_payload(note: Any, default_channel: int) -> tuple[int, int, int, int, int]:
+    if isinstance(note, dict):
+        tick = note.get("start_tick", note.get("tick", 0))
+        duration = note.get("duration_ticks", note.get("duration", 480))
+        pitch = note.get("pitch", 60)
+        velocity = note.get("velocity", 80)
+        channel = note.get("channel", default_channel)
+    else:
+        tick = getattr(note, "start_tick", getattr(note, "tick", 0))
+        duration = getattr(note, "duration_ticks", getattr(note, "duration", 480))
+        pitch = getattr(note, "pitch", 60)
+        velocity = getattr(note, "velocity", 80)
+        channel = getattr(note, "channel", default_channel)
+
+    try:
+        tick = max(0, int(tick))
+    except (TypeError, ValueError):
+        tick = 0
+    try:
+        duration = max(1, int(duration))
+    except (TypeError, ValueError):
+        duration = 480
+    try:
+        pitch = max(0, min(127, int(pitch)))
+    except (TypeError, ValueError):
+        pitch = 60
+    try:
+        velocity = max(0, min(127, int(velocity)))
+    except (TypeError, ValueError):
+        velocity = 80
+    try:
+        channel = int(channel)
+    except (TypeError, ValueError):
+        channel = default_channel
+
+    if channel == 0 and default_channel not in (None, 0):
+        channel = int(default_channel)
+
+    return tick, pitch, velocity, duration, max(0, min(15, int(channel)))
+
+
+def run_generation(
+    prompt: str,
+    output_dir: Path | str,
+    genre_override: str = None,
+    bpm_override: int = None,
+    key_override: str = None,
+    reference_url: str = None,
+    export_mpc: bool = False,
+    export_stems: bool = False,
+    soundfont_path: str = None,
+    template_path: str = None,
+    instruments_paths: list = None,
+    skip_default_instruments: bool = False,
+    skip_expansions: bool = False,
+    verbose: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
+    seed: Optional[int] = None,
+    use_bwf: bool = True,
+    takes: int = 0,
+    comp: bool = False,
+    comp_bars: int = 2,
+    require_soundfont: bool = False,
+    preset: str = None,
+    style_preset: str = None,
+    production_preset: str = None,
+    duration_bars: Optional[int] = None,
+    tension_arc_shape: Optional[str] = None,
+    tension_intensity: Optional[float] = None,
+    motif_mode: Optional[str] = None,
+    num_motifs: Optional[int] = None,
+    use_agents: Optional[bool] = None,
+    score_plan: Optional[dict] = None,
+    orchestral_stage_preset: Optional[str] = None,
+) -> dict:
+    """Run the full music generation pipeline.
+    
+    Args:
+        prompt: Natural language music prompt
+        output_dir: Directory for output files
+        genre_override: Override genre from prompt (e.g., "g_funk", "trap_soul")
+        bpm_override: Override BPM from prompt
+        key_override: Override key from prompt (e.g., "Cm", "F#m")
+        reference_url: YouTube URL or audio file to analyze for style reference
+        export_mpc: Export to MPC .xpj format
+        export_stems: Export individual stem files
+        soundfont_path: Path to SoundFont file for audio rendering
+        template_path: Path to MPC template file
+        instruments_paths: List of paths to instrument folders for intelligent sample selection
+        skip_default_instruments: Do not auto-load ./instruments when instruments_paths is omitted
+        skip_expansions: Do not scan/register ../expansions for this generation
+        verbose: Enable verbose output
+        progress_callback: Optional callback for progress reporting (step, percent, message)
+        seed: Random seed for reproducibility (enables iterative refinement)
+        use_bwf: Use Broadcast Wave Format with AI provenance metadata (default: True)
+        takes: Number of alternative takes to generate per track
+        comp: Auto-generate comp track from best sections of each take
+        comp_bars: Number of bars per comp section (default: 2)
+        use_agents: Use agent-based generation for Ethiopian instruments.
+            If None, Ethiopian-family genres auto-enable agents.
+        score_plan: Optional score plan dict (Copilot orchestration)
+        
+    Returns:
+        Dictionary with paths to generated files
+    """
+    # Ensure output_dir is a Path object
+    output_dir = Path(output_dir) if isinstance(output_dir, str) else output_dir
+
+    if skip_expansions:
+        # Isolation mode: prevent stale module-level expansion-backed services from
+        # influencing prompt parsing or later default instrument resolution.
+        set_instrument_service(None)
+
+    score_plan_parsed = None
+    score_plan_score = None
+    score_plan_mastering = {}
+    if score_plan:
+        try:
+            validate_score_plan(score_plan)
+        except ScorePlanError as e:
+            raise ValueError(f"Invalid score plan: {e}") from e
+
+        plan_prompt = str(score_plan.get("prompt", "")).strip()
+        if plan_prompt:
+            if plan_prompt != prompt and verbose:
+                print_info(f"Score plan prompt applied: \"{plan_prompt}\"")
+            prompt = plan_prompt
+
+        if seed is None:
+            plan_seed = extract_seed(score_plan)
+            if plan_seed is not None:
+                seed = plan_seed
+
+        score_plan_parsed = score_plan_to_parsed_prompt(score_plan)
+        score_plan_score = score_plan_to_performance_score(score_plan)
+        score_plan_mastering = extract_mastering_overrides(score_plan)
+    
+    # Set random seed if provided
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+    else:
+        # Generate seed for reproducibility
+        seed = np.random.randint(0, 2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+    
+    # Helper to report progress
+    def report_progress(step: str, percent: float, message: str):
+        if progress_callback:
+            progress_callback(step, percent, message)
+    
+    results = {
+        "midi": None,
+        "audio": None,
+        "mpc": None,
+        "stems": [],
+        "samples": [],
+        "takes": {},  # Store alternative takes
+        "comps": {},  # Store composite tracks
+        "reference_analysis": None,
+        "instrument_patches": [],
+        "instruments_used": [],
+        "seed": seed,  # Store seed in results
+        "synthesis_params": {},  # Store synthesis parameters
+    }
+    
+    reference_info = None
+    instrument_library = None
+
+    # Preserve user prompt before any reference-based enhancement.
+    base_prompt = prompt
+    
+    # TASK 2: Auto-extract YouTube URL from prompt text if no explicit reference_url provided
+    if not reference_url:
+        extracted_url = extract_youtube_url(prompt)
+        if extracted_url:
+            reference_url = extracted_url
+            if verbose:
+                print_info(f"Auto-extracted YouTube URL from prompt: {reference_url}")
+    
+    # Step 0: Analyze reference track if provided
+    # TASK 4: Skip expensive re-download if we already have pre-analyzed values from JUCE
+    if reference_url:
+        # Check if we already have pre-analyzed values (e.g., from JUCE frontend)
+        # If both BPM and key are already set, skip the expensive download/analysis
+        if bpm_override and key_override:
+            print_step("0/6", "Using pre-analyzed reference values (skipping re-download)...")
+            print_info(f"Pre-analyzed: {bpm_override} BPM, {key_override}")
+            
+            # Store minimal reference info without re-analyzing
+            results["reference_analysis"] = {
+                "source": reference_url,
+                "title": "(pre-analyzed by frontend)",
+                "bpm": bpm_override,
+                "key": key_override.rstrip('m'),
+                "mode": "minor" if key_override.endswith('m') else "major",
+                "genre": genre_override or "",
+                "style_tags": [],
+                "prompt_hints": "",
+                "pre_analyzed": True,
+            }
+            
+            reference_info = {
+                "title": "(pre-analyzed)",
+                "detected_bpm": bpm_override,
+                "detected_key": key_override,
+                "detected_genre": genre_override or "(from prompt)",
+                "style_hints": "",
+            }
+        else:
+            # No pre-analyzed values, perform full analysis
+            print_step("0/6", "Analyzing reference track...")
+            try:
+                from multimodal_gen import ReferenceAnalyzer, analyze_reference
+                
+                analyzer = ReferenceAnalyzer(
+                    cache_dir=str(output_dir / ".reference_cache"),
+                    verbose=verbose
+                )
+                
+                if reference_url.startswith(("http://", "https://")):
+                    analysis = analyzer.analyze_url(reference_url)
+                else:
+                    analysis = analyzer.analyze_file(reference_url)
+                
+                # Store analysis results
+                results["reference_analysis"] = {
+                    "source": reference_url,
+                    "title": analysis.title,
+                    "bpm": analysis.bpm,
+                    "key": analysis.key,
+                    "mode": analysis.mode,
+                    "genre": analysis.estimated_genre,
+                    "style_tags": analysis.style_tags,
+                    # Store the hints actually used to enhance the prompt (genre excluded by default)
+                    "prompt_hints": analysis.to_prompt_hints(include_genre=False),
+                    # Store generation params for drum/bass generation influence
+                    "generation_params": analysis.to_generation_params(),
+                }
+                # Sprint 8.3: Reference profile bridge
+                # NOTE: analysis is ReferenceAnalysis (prompt hints, BPM, key, genre).
+                # set_reference_profile() needs ReferenceProfile (spectral curve, LUFS, dynamics).
+                # The bridge requires the raw audio to build a ReferenceProfile via
+                # reference_matching.ReferenceAnalyzer.analyze(audio). Store the spectral data
+                # from the analysis for partial bridging.
+                if hasattr(analysis, 'spectral') and analysis.spectral is not None:
+                    try:
+                        from multimodal_gen.reference_matching import ReferenceProfile
+                        _ref_profile = ReferenceProfile(
+                            name=getattr(analysis, 'title', 'reference'),
+                            integrated_lufs=-14.0,  # Default — full profile needs raw audio
+                        )
+                        results["_reference_profile_obj"] = _ref_profile
+                    except Exception:
+                        results["_reference_profile_obj"] = None
+                else:
+                    results["_reference_profile_obj"] = None
+                
+                reference_info = {
+                    "title": analysis.title,
+                    "detected_bpm": analysis.bpm,
+                    "detected_key": f"{analysis.key} {analysis.mode}",
+                    "detected_genre": analysis.estimated_genre,
+                    "style_hints": ", ".join(analysis.style_tags[:5]),
+                }
+                
+                print_success(f"Reference analyzed: {analysis.title}")
+                print_info(f"Detected: {analysis.bpm:.0f} BPM, {analysis.key} {analysis.mode}, {analysis.estimated_genre}")
+                
+                # Enhance prompt with reference analysis
+                enhanced_hints = analysis.to_prompt_hints(include_genre=False)
+                prompt = f"{prompt}, {enhanced_hints}"
+                if verbose:
+                    print_info(f"Enhanced prompt: {prompt}")
+                
+                # Apply detected values as defaults (can be overridden)
+                if not bpm_override:
+                    bpm_override = int(analysis.bpm)
+                    if verbose:
+                        print_info(f"Using detected BPM: {bpm_override}")
+                
+                if not key_override:
+                    key_override = f"{analysis.key}{'m' if analysis.mode == 'minor' else ''}"
+                    if verbose:
+                        print_info(f"Using detected key: {key_override}")
+                        
+            except ImportError as e:
+                print_warning(f"Reference analysis requires additional packages: {e}")
+                print_info("Install with: pip install librosa yt-dlp")
+            except Exception as e:
+                print_warning(f"Reference analysis failed: {e}")
+                print_info("Continuing with text prompt only...")
+    
+    # Step 1: Parse prompt
+    print_step("1/6", "Parsing prompt...")
+    report_progress("parsing", 0.05, "Parsing prompt...")
+    parser = PromptParser()
+    if score_plan_parsed is not None:
+        base_parsed = copy.deepcopy(score_plan_parsed)
+        parsed = score_plan_parsed
+    else:
+        base_parsed = parser.parse(base_prompt)
+        parsed = parser.parse(prompt)
+
+    # Normalize genre strings early so downstream modules always see internal keys.
+    try:
+        from multimodal_gen.utils import normalize_genre
+        base_parsed.genre = normalize_genre(base_parsed.genre)
+        parsed.genre = normalize_genre(parsed.genre)
+    except Exception:
+        pass
+
+    # If the user explicitly asked for a genre/instruments in the original prompt,
+    # do not let reference-based hinting override that intent.
+    if base_parsed.genre and base_parsed.genre != parsed.genre:
+        parsed.genre = base_parsed.genre
+
+    if getattr(base_parsed, 'instruments', None):
+        if base_parsed.instruments and (not parsed.instruments or base_parsed.instruments != parsed.instruments):
+            parsed.instruments = base_parsed.instruments
+    
+    # Apply overrides
+    if genre_override:
+        from multimodal_gen.utils import normalize_genre
+        parsed.genre = normalize_genre(genre_override)
+        # Re-apply genre intelligence to update drum/instrument defaults
+        parsed._apply_genre_intelligence()
+        if verbose:
+            print_info(f"Genre override applied: {parsed.genre}")
+    
+    if bpm_override:
+        parsed.bpm = bpm_override
+        if verbose:
+            print_info(f"BPM override applied: {bpm_override}")
+    
+    if key_override:
+        # Parse key override (e.g., "Cm" -> key="C", scale_type=MINOR)
+        from multimodal_gen.utils import ScaleType
+        if key_override.endswith("m"):
+            parsed.key = key_override[:-1]
+            parsed.scale_type = ScaleType.MINOR
+        else:
+            parsed.key = key_override
+            parsed.scale_type = ScaleType.MAJOR
+        if verbose:
+            print_info(f"Key override applied: {parsed.key} {parsed.scale_type.value}")
+
+    from multimodal_gen.utils import normalize_genre
+    ethiopian_genres = {'ethiopian', 'ethio_jazz', 'ethiopian_traditional', 'eskista'}
+    normalized_parsed_genre = normalize_genre(parsed.genre)
+    if use_agents is None and normalized_parsed_genre in ethiopian_genres:
+        use_agents = True
+        if verbose:
+            print_info(
+                f"Auto-enabled agent-based generation for Ethiopian-family genre: {normalized_parsed_genre}"
+            )
+
+    # Apply preset system (explicit opt-in only)
+    preset_values: dict = {}
+    try:
+        from multimodal_gen.preset_system import PresetManager
+
+        requested_preset = (preset or getattr(parsed, 'preset', None))
+        requested_style = (style_preset or getattr(parsed, 'style_preset', None))
+        requested_production = (production_preset or score_plan_mastering.get('production_preset') or getattr(parsed, 'production_preset', None))
+
+        if requested_preset or requested_style or requested_production:
+            manager = PresetManager()
+            # Precedence: base preset -> style -> production
+            if requested_preset:
+                manager.apply_preset(str(requested_preset))
+            if requested_style:
+                manager.apply_preset(str(requested_style))
+            if requested_production:
+                manager.apply_preset(str(requested_production))
+
+            preset_values = {k: pv.value for k, pv in manager.get_all_values().items()}
+
+            # Apply a few key overrides onto ParsedPrompt so arrangement/MIDI have a consistent view.
+            if 'swing_amount' in preset_values:
+                try:
+                    parsed.swing_amount = float(preset_values['swing_amount'])
+                    parsed.use_swing = parsed.swing_amount > 0
+                except Exception:
+                    pass
+            if 'tension_arc_shape' in preset_values and not getattr(parsed, 'tension_arc_shape', None):
+                parsed.tension_arc_shape = str(preset_values['tension_arc_shape'])
+            if 'tension_intensity' in preset_values and getattr(parsed, 'tension_intensity', None) is None:
+                try:
+                    parsed.tension_intensity = float(preset_values['tension_intensity'])
+                except Exception:
+                    pass
+
+            if verbose:
+                applied_names = [n for n in [requested_preset, requested_style, requested_production] if n]
+                print_info(f"Preset(s) applied: {', '.join(applied_names)}")
+    except Exception as e:
+        if verbose:
+            print_warning(f"Preset system skipped: {e}")
+
+    if score_plan_mastering:
+        for key in ('brightness_target', 'warmth_target', 'target_lufs', 'master_ceiling_db', 'stem_headroom_db'):
+            if key in score_plan_mastering:
+                preset_values[key] = score_plan_mastering[key]
+
+    # Phase 5.2: apply explicit OSC/CLI overrides after presets, before arranging.
+    if tension_arc_shape is not None:
+        try:
+            shape = str(tension_arc_shape).strip()
+            parsed.tension_arc_shape = shape if shape else None
+        except Exception:
+            pass
+
+    if tension_intensity is not None:
+        try:
+            parsed.tension_intensity = max(0.0, min(1.0, float(tension_intensity)))
+        except Exception:
+            pass
+
+    if duration_bars is None and score_plan:
+        try:
+            plan_duration_bars = score_plan.get("duration_bars")
+            if plan_duration_bars is None:
+                plan_duration_bars = sum(
+                    int(section.get("bars", 0)) for section in score_plan.get("sections", [])
+                )
+            duration_bars = int(plan_duration_bars) if plan_duration_bars else None
+        except Exception:
+            duration_bars = None
+
+    if duration_bars is not None:
+        try:
+            bars = int(duration_bars)
+            if bars > 0:
+                beats_per_bar = parsed.time_signature[0] if parsed.time_signature else 4
+                bpm_val = float(parsed.bpm) if parsed.bpm else 120.0
+                bpm_val = max(30.0, bpm_val)
+                parsed.target_duration_seconds = (bars * beats_per_bar * 60.0) / bpm_val
+                parsed.target_bars = bars
+        except Exception:
+            pass
+    
+    print_parsed_prompt(parsed, reference_info)
+    explicit_stage_preset = None
+    if orchestral_stage_preset:
+        preset_key = str(orchestral_stage_preset).strip().lower()
+        if preset_key in {'chamber', 'concert', 'epic'}:
+            setattr(parsed, 'orchestral_stage_preset', preset_key)
+            explicit_stage_preset = preset_key
+
+    try:
+        from multimodal_gen.orchestral_stage import resolve_stage_profile_name
+        from multimodal_gen.utils import normalize_genre
+        if normalize_genre(getattr(parsed, 'genre', '') or '') in {'cinematic', 'classical', 'orchestral', 'film_score'}:
+            results['orchestral_stage_preset'] = explicit_stage_preset or 'auto'
+            results['orchestral_stage_preset_resolved'] = explicit_stage_preset or resolve_stage_profile_name(
+                genre=getattr(parsed, 'genre', '') or '',
+                prompt=getattr(parsed, 'raw_prompt', '') or prompt,
+                instruments=list(getattr(parsed, 'instruments', []) or []),
+            )
+    except Exception:
+        if explicit_stage_preset:
+            results['orchestral_stage_preset'] = explicit_stage_preset
+            results['orchestral_stage_preset_resolved'] = explicit_stage_preset
+    
+    # Apply reference analysis drum/bass params to parsed prompt
+    # These influence drum density, hi-hat style, and 808 usage during generation
+    if results.get("reference_analysis") and results["reference_analysis"].get("generation_params"):
+        ref_params = results["reference_analysis"]["generation_params"]
+        
+        # drum_density: 0.0-1.0 from reference track analysis
+        if "drum_density" in ref_params:
+            parsed.reference_drum_density = float(ref_params["drum_density"])
+            if verbose:
+                print_info(f"Reference drum density: {parsed.reference_drum_density:.2f}")
+        
+        # trap_hihats: True if rapid hi-hat patterns detected
+        if "trap_hihats" in ref_params:
+            parsed.reference_trap_hihats = bool(ref_params["trap_hihats"])
+            if parsed.reference_trap_hihats:
+                # Also enable hi-hat rolls in the prompt for consistency
+                parsed.use_hihat_rolls = True
+                parsed.hihat_density = '16th'  # Dense trap-style hi-hats
+            if verbose:
+                print_info(f"Reference trap hi-hats: {parsed.reference_trap_hihats}")
+        
+        # has_808: True if 808-style sub-bass detected
+        if "has_808" in ref_params:
+            parsed.reference_has_808 = bool(ref_params["has_808"])
+            if parsed.reference_has_808:
+                # Ensure 808 is in drum elements if not already
+                if '808' not in parsed.drum_elements:
+                    parsed.drum_elements.append('808')
+                # Update character for sub-bass presence
+                parsed.character_808 = 'heavy'
+            if verbose:
+                print_info(f"Reference has 808: {parsed.reference_has_808}")
+
+    instrument_patches = build_track_scoped_instrument_patches(
+        list(getattr(parsed, "instruments", []) or [])
+        + list(getattr(parsed, "drum_elements", []) or []),
+        genre=parsed.genre,
+    )
+    results["instrument_patches"] = [patch.to_dict() for patch in instrument_patches]
+    
+    # Step 1.5: Validate against Genre Rules
+    print_step("1.5/6", "Validating genre rules...")
+    try:
+        # Check for violations
+        validation_result = validate_generation(
+            parsed.genre, 
+            parsed.instruments, 
+            parsed.drum_elements, 
+            [] # patterns not yet generated
+        )
+        
+        if not validation_result.valid or validation_result.violations:
+            print_warning(f"Found {len(validation_result.violations)} genre rule violations:")
+            for v in validation_result.violations:
+                print_info(f"  - {v.message}")
+            
+            # Auto-repair
+            print_info("Attempting auto-repair...")
+            repaired_elements, repair_log = repair_violations(
+                parsed.genre, 
+                parsed.instruments + parsed.drum_elements
+            )
+            
+            # Update parsed prompt with repaired elements
+            # (This is a simplification; in a full implementation we'd map back to specific fields)
+            if repair_log:
+                print_success(f"Repaired {len(repair_log)} issues")
+                for log in repair_log:
+                    print_info(f"  - {log['original']} -> {log.get('result', 'removed')}")
+    except Exception as e:
+        print_warning(f"Genre rule validation skipped: {e}")
+    
+    # Step 2: Create arrangement
+    print_step("2/6", "Creating arrangement...")
+    report_progress("arranging", 0.15, "Creating arrangement...")
+    
+    # Pass user-specified duration if provided, otherwise Arranger uses its default (3 min)
+    arranger = Arranger(target_duration_seconds=parsed.target_duration_seconds)
+
+    score_plan_sections = score_plan_score.sections if score_plan_score else None
+    if score_plan_sections:
+        total_ticks = score_plan_sections[-1].end_tick if score_plan_sections else 0
+        total_bars = sum(s.bars for s in score_plan_sections)
+        
+        # Build TensionArc from score plan tension_curve if provided
+        _sp_tension_arc = None
+        if score_plan_score and getattr(score_plan_score, 'tension_curve', None):
+            from multimodal_gen.tension_arc import TensionArc, TensionPoint, ArcShape
+            n = len(score_plan_score.tension_curve)
+            _sp_tension_arc = TensionArc(
+                points=[
+                    TensionPoint(position=i / max(n - 1, 1), tension=t)
+                    for i, t in enumerate(score_plan_score.tension_curve)
+                ],
+                shape=ArcShape.FLAT,  # custom points override shape
+            )
+        
+        arrangement = Arrangement(
+            sections=score_plan_sections,
+            total_bars=total_bars,
+            total_ticks=total_ticks,
+            bpm=parsed.bpm,
+            time_signature=parsed.time_signature,
+            tension_arc=_sp_tension_arc,
+            chord_map=getattr(score_plan_score, 'chord_map', {}) or {},
+        )
+    else:
+        # Motif wiring (Phase 2): for prioritized genres, generate motifs + per-section assignments
+        # to drive coherent melodic themes across the full arrangement.
+        try:
+            from multimodal_gen.arranger import generate_arrangement_with_motifs
+            from multimodal_gen.utils import normalize_genre
+
+            normalized_genre = normalize_genre(parsed.genre)
+            use_motifs = normalized_genre in [
+                'ethiopian', 'ethio_jazz', 'ethiopian_traditional', 'eskista',
+                'g_funk', 'cinematic', 'classical'
+            ]
+
+            # Phase 5.2: explicit override (auto|on|off)
+            force_motifs = None
+            try:
+                mm = (motif_mode or "").strip().lower()
+                if mm in ("on", "true", "1", "yes", "enable", "enabled"):
+                    force_motifs = True
+                elif mm in ("off", "false", "0", "no", "disable", "disabled"):
+                    force_motifs = False
+            except Exception:
+                force_motifs = None
+
+            if force_motifs is not None:
+                use_motifs = force_motifs
+
+            nm = 2
+            try:
+                if num_motifs is not None:
+                    nm = max(1, min(3, int(num_motifs)))
+            except Exception:
+                nm = 2
+
+            if use_motifs:
+                arrangement = generate_arrangement_with_motifs(
+                    parsed,
+                    num_motifs=nm,
+                    seed=seed,
+                    target_duration_seconds=parsed.target_duration_seconds,
+                )
+            else:
+                arrangement = arranger.create_arrangement(parsed)
+        except Exception:
+            arrangement = arranger.create_arrangement(parsed)
+    
+    # Log duration info
+    estimated_duration = arrangement.total_bars * 4 * 60 / parsed.bpm  # bars * beats/bar * sec/min / bpm
+    if parsed.target_duration_seconds:
+        print_info(f"Target duration: {parsed.target_duration_seconds/60:.1f} min -> {arrangement.total_bars} bars (~{estimated_duration/60:.1f} min)")
+    else:
+        print_info(f"Default duration: ~{estimated_duration/60:.1f} min ({arrangement.total_bars} bars)")
+    
+    if verbose:
+        print_info(f"Arrangement: {len(arrangement.sections)} sections, {arrangement.total_bars} bars")
+        bar_pos = 0
+        for section in arrangement.sections:
+            print_info(f"  - {section.section_type.value}: {section.bars} bars (tick {section.start_tick})")
+            bar_pos += section.bars
+    
+    # Step 2.5: Build Session Graph
+    print_step("2.5/6", "Building session graph...")
+    session_graph = None
+    try:
+        graph_builder = SessionGraphBuilder()
+        # Pass reference analysis if available
+        ref_analysis_obj = None
+        if results.get("reference_analysis"):
+            # Reconstruct minimal object if needed, or pass dict if builder supports it
+            # For now, we'll rely on the builder handling the parsed prompt primarily
+            pass
+            
+        session_graph = graph_builder.build_from_prompt(parsed)
+        
+        # Sync arrangement into graph
+        session_graph = graph_builder.build_from_arrangement(session_graph, arrangement)
+        
+        print_success(f"Session graph built: {len(session_graph.tracks)} tracks, {len(session_graph.sections)} sections")
+    except Exception as e:
+        print_warning(f"Session graph build failed: {e}")
+
+    # Step 2.6: Load expansion packs EARLY so MidiGenerator can use them
+    # This MUST happen before MIDI generation for expansion instruments to be assigned
+    # proper MIDI programs (e.g., Ethiopian instruments like Krar, Masenqo)
+    expansion_manager = None
+    instrument_service = None
+    expansions_dir = Path(__file__).parent.parent / "expansions"
+    if not skip_expansions and expansions_dir.exists():
+        try:
+            from multimodal_gen import ExpansionManager
+            expansion_manager = ExpansionManager()
+            exp_count = expansion_manager.scan_expansions(str(expansions_dir))
+            if exp_count > 0 and verbose:
+                print_info(f"Loaded {exp_count} expansion pack(s) for specialized instruments")
+        except Exception as e:
+            if verbose:
+                print_warning(f"Expansion loading: {e}")
+    elif skip_expansions and verbose:
+        print_info("Skipping expansion pack scan (--skip-expansions)")
+    
+    # Step 2.6.1: Create InstrumentResolutionService to bridge expansions to MIDI generation
+    # CRITICAL: This must happen BEFORE MidiGenerator is created so expansion instruments
+    # (Ethiopian, Funk o Rama, etc.) get proper MIDI program assignments
+    if not skip_expansions:
+        try:
+            from multimodal_gen.instrument_resolution import InstrumentResolutionService
+            instrument_service = InstrumentResolutionService(
+                expansion_manager=expansion_manager,
+                auto_register_expansions=True
+            )
+            # Set the module-level service for prompt_parser to use
+            set_instrument_service(instrument_service)
+            if verbose and expansion_manager:
+                stats = instrument_service.get_registry_stats()
+                print_info(f"InstrumentResolutionService: {stats['total_instruments']} instruments, "
+                          f"{stats['expansion_programs_allocated']} expansion programs allocated")
+        except Exception as e:
+            if verbose:
+                print_warning(f"InstrumentResolutionService setup: {e}")
+            instrument_service = None
+
+    # Step 3: Generate MIDI
+    print_step("3/6", "Generating MIDI with humanization...")
+    report_progress("generating_midi", 0.35, "Generating MIDI with humanization...")
+    # Optional: HarmonicBrain for voice-leading intelligence (Sprint 5)
+    harmonic_brain = None
+    try:
+        from multimodal_gen.intelligence.harmonic_brain import HarmonicBrain
+        harmonic_brain = HarmonicBrain(auto_load_corpus=True)
+    except Exception:
+        harmonic_brain = None
+    # Now instrument_service is available for MidiGenerator to use expansion instruments
+    midi_gen = MidiGenerator(
+        instrument_service=instrument_service,
+        harmonic_brain=harmonic_brain,
+        orchestral_stage_preset=orchestral_stage_preset,
+    )
+    
+    # Compile style policy for coherent producer decisions
+    policy_context = None
+    if HAS_STYLE_POLICY and compile_policy:
+        try:
+            policy_context = compile_policy(parsed)
+
+            # Apply preset values onto the policy context (if requested).
+            if preset_values:
+                # Timing
+                if 'swing_amount' in preset_values:
+                    try:
+                        policy_context.timing.swing_amount = max(0.0, min(1.0, float(preset_values['swing_amount'])))
+                    except Exception:
+                        pass
+
+                # Prefer groove_tightness -> timing variance mapping if provided.
+                jitter = None
+                if 'groove_tightness' in preset_values:
+                    try:
+                        tight = max(0.0, min(1.0, float(preset_values['groove_tightness'])))
+                        jitter = 0.005 + 0.05 * (1.0 - tight)
+                    except Exception:
+                        jitter = None
+                if jitter is None and 'timing_variance' in preset_values:
+                    try:
+                        tv = max(0.0, min(1.0, float(preset_values['timing_variance'])))
+                        jitter = 0.005 + 0.055 * tv
+                    except Exception:
+                        jitter = None
+                if jitter is None and 'microtiming_intensity' in preset_values:
+                    try:
+                        mt = max(0.0, min(1.0, float(preset_values['microtiming_intensity'])))
+                        jitter = 0.005 + 0.055 * mt
+                    except Exception:
+                        jitter = None
+                if jitter is not None:
+                    policy_context.timing.timing_jitter = float(jitter)
+
+                if 'humanize_amount' in preset_values:
+                    try:
+                        ha = max(0.0, min(1.0, float(preset_values['humanize_amount'])))
+                        policy_context.timing.velocity_variation = 0.05 + 0.20 * ha
+                        policy_context.timing.timing_jitter = max(policy_context.timing.timing_jitter, 0.005 + 0.045 * ha)
+                    except Exception:
+                        pass
+
+                # Dynamics
+                if 'accent_strength' in preset_values:
+                    try:
+                        policy_context.dynamics.accent_strength = max(0.0, min(1.0, float(preset_values['accent_strength'])))
+                    except Exception:
+                        pass
+                if 'ghost_note_probability' in preset_values:
+                    try:
+                        policy_context.dynamics.ghost_note_probability = max(0.0, min(1.0, float(preset_values['ghost_note_probability'])))
+                    except Exception:
+                        pass
+                if 'velocity_range' in preset_values:
+                    try:
+                        vmin, vmax = preset_values['velocity_range']
+                        vmin_i = int(max(1, min(126, int(vmin))))
+                        vmax_i = int(max(vmin_i + 1, min(127, int(vmax))))
+
+                        def _clamp_rng(rng):
+                            a, b = rng
+                            a2 = int(max(vmin_i, min(vmax_i - 1, int(a))))
+                            b2 = int(max(a2 + 1, min(vmax_i, int(b))))
+                            return (a2, b2)
+
+                        policy_context.dynamics.kick_velocity_range = _clamp_rng(policy_context.dynamics.kick_velocity_range)
+                        policy_context.dynamics.snare_velocity_range = _clamp_rng(policy_context.dynamics.snare_velocity_range)
+                        policy_context.dynamics.hihat_velocity_range = _clamp_rng(policy_context.dynamics.hihat_velocity_range)
+                        policy_context.dynamics.bass_velocity_range = _clamp_rng(policy_context.dynamics.bass_velocity_range)
+                        policy_context.dynamics.chord_velocity_range = _clamp_rng(policy_context.dynamics.chord_velocity_range)
+                    except Exception:
+                        pass
+
+                # Arrangement
+                if 'variation_intensity' in preset_values:
+                    try:
+                        policy_context.arrangement.variation_intensity = max(0.0, min(1.0, float(preset_values['variation_intensity'])))
+                    except Exception:
+                        pass
+                if 'pattern_intensity' in preset_values:
+                    try:
+                        pi = str(preset_values['pattern_intensity']).strip().lower()
+                        density_map = {
+                            'low': ArrangementDensity.SPARSE,
+                            'medium': ArrangementDensity.MODERATE,
+                            'high': ArrangementDensity.DENSE,
+                            'intense': ArrangementDensity.DENSE,
+                        }
+                        policy_context.arrangement.density = density_map.get(pi, policy_context.arrangement.density)
+                        if pi == 'low':
+                            policy_context.arrangement.fill_frequency_bars = 16
+                            policy_context.arrangement.fill_intensity = min(policy_context.arrangement.fill_intensity, 0.35)
+                        elif pi == 'medium':
+                            policy_context.arrangement.fill_frequency_bars = 8
+                        elif pi == 'high':
+                            policy_context.arrangement.fill_frequency_bars = 4
+                            policy_context.arrangement.fill_intensity = max(policy_context.arrangement.fill_intensity, 0.6)
+                        elif pi == 'intense':
+                            policy_context.arrangement.fill_frequency_bars = 2
+                            policy_context.arrangement.fill_intensity = max(policy_context.arrangement.fill_intensity, 0.75)
+                    except Exception:
+                        pass
+
+                if 'target_lufs' in preset_values:
+                    try:
+                        policy_context.mix.target_lufs = float(preset_values['target_lufs'])
+                    except Exception:
+                        pass
+                if 'brightness_target' in preset_values:
+                    try:
+                        policy_context.mix.brightness_target = max(0.0, min(1.0, float(preset_values['brightness_target'])))
+                    except Exception:
+                        pass
+                if 'warmth_target' in preset_values:
+                    try:
+                        policy_context.mix.warmth_target = max(0.0, min(1.0, float(preset_values['warmth_target'])))
+                    except Exception:
+                        pass
+                if 'stem_headroom_db' in preset_values:
+                    try:
+                        policy_context.mix.stem_headroom_db = float(preset_values['stem_headroom_db'])
+                    except Exception:
+                        pass
+                if 'master_ceiling_db' in preset_values:
+                    try:
+                        policy_context.mix.master_ceiling_db = float(preset_values['master_ceiling_db'])
+                    except Exception:
+                        pass
+
+            print_info(f"Style policy: {parsed.genre} -> swing={policy_context.timing.swing_amount:.0%}, "
+                      f"ghost={policy_context.dynamics.ghost_note_probability:.0%}, "
+                      f"voicing={policy_context.voicing.style.value}")
+        except Exception as e:
+            print_warning(f"Style policy compilation failed: {e}")
+    
+    # Get groove from session graph if available
+    groove_template = session_graph.groove_template if session_graph else None
+    
+    # Agent-based generation (experimental - for Ethiopian instruments)
+    # This provides more authentic qenet-based patterns for traditional instruments
+    agent_performances = None
+    if use_agents and HAS_AGENT_SYSTEM:
+        try:
+            import mido
+            
+            normalized_genre = normalize_genre(parsed.genre)
+            
+            if normalized_genre in ethiopian_genres:
+                print_info("Using agent-based generation for Ethiopian instruments...")
+                
+                # Create conductor
+                conductor = OfflineConductor()
+                
+                # Research style (prompt is already parsed)
+                style_intel = conductor.research_style(parsed)
+                mood = style_intel.get('mood', 'traditional')
+                energy = style_intel.get('energy', 0.5)
+                if isinstance(mood, str):
+                    print_info(f"Conductor style research: {mood} mood")
+                else:
+                    print_info(f"Conductor style research: energy={energy:.0%}")
+
+                create_score_from_arrangement = getattr(conductor, "create_score_from_arrangement", None)
+                if callable(create_score_from_arrangement):
+                    score = create_score_from_arrangement(arrangement, parsed, style_intel)
+                else:
+                    score = conductor.create_score(parsed, style_intel)
+                
+                # Assemble Ethiopian ensemble
+                ensemble = conductor.assemble_ensemble(parsed, style_intel)
+                if ensemble:
+                    print_info(f"Ensemble: {[agent.__class__.__name__ for agent in ensemble.values()]}")
+                
+                # Conduct performance (generates MIDI tracks per agent)
+                agent_performances = conductor.conduct_performance(score, ensemble)
+                
+                if agent_performances:
+                    print_success(f"Agent-based generation: {len(agent_performances)} performer tracks")
+                else:
+                    print_warning("Agent-based generation produced no tracks, falling back to standard")
+            else:
+                if verbose:
+                    print_info(f"Agent system available but not used for genre: {normalized_genre}")
+        except Exception as e:
+            print_warning(f"Agent-based generation failed: {e}, falling back to standard")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+            agent_performances = None
+    elif use_agents and not HAS_AGENT_SYSTEM:
+        print_warning("Agent system requested but not available (check imports)")
+    
+    midi_file = midi_gen.generate(
+        arrangement, 
+        parsed, 
+        groove_template=groove_template,
+        policy_context=policy_context
+    )
+
+    # ── Sprint 5: Post-generation quality gate ──
+    quality_report = None
+    try:
+        from multimodal_gen.intelligence.critics import run_all_critics
+        quality_report = _run_quality_gate(midi_file, arrangement, verbose)
+        if quality_report and not quality_report.get("passed", True) and verbose:
+            print_warning(f"Quality gate: {quality_report.get('summary', 'issues detected')}")
+    except Exception as e:
+        if verbose:
+            print_warning(f"Quality gate skipped: {e}")
+
+    # Comprehensive quality validation (Sprint 7)
+    if _HAS_QUALITY_VALIDATOR:
+        try:
+            validator = QualityValidator()
+            all_notes = []
+            pending = {}  # (track_idx, pitch) -> (tick, velocity)
+            for t_idx, track in enumerate(midi_file.tracks):
+                tick = 0
+                for msg in track:
+                    tick += msg.time
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        pending[(t_idx, msg.note)] = (tick, msg.velocity)
+                    elif (msg.type == 'note_off' or
+                          (msg.type == 'note_on' and msg.velocity == 0)):
+                        key = (t_idx, msg.note)
+                        if key in pending:
+                            start, vel = pending.pop(key)
+                            dur = max(1, tick - start)
+                            all_notes.append((start, dur, msg.note, vel))
+            # Add any unclosed notes with fallback duration
+            for (t_idx, pitch), (start, vel) in pending.items():
+                all_notes.append((start, 480, pitch, vel))
+            if all_notes:
+                report = validator.validate(
+                    notes=all_notes,
+                    genre=(parsed.genre or 'pop').replace('-', '_'),
+                    key=parsed.key or 'C',
+                    scale=parsed.scale_type.name.lower() if parsed.scale_type else 'minor',
+                    tempo=parsed.bpm or 120,
+                    ticks_per_beat=midi_file.ticks_per_beat
+                )
+                if verbose:
+                    print(f"  Quality score: {report.overall_score:.1f}/100 ({report.overall_level.value})")
+                    for rec in report.recommendations[:3]:
+                        print(f"    \u2192 {rec}")
+                    if _HAS_STEM_SEPARATION:
+                        try:
+                            backends = check_separation_backends()
+                            active = [k for k, v in backends.items() if v]
+                            print(f"  [*] Stem separation available (backends: {', '.join(active)})")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    # Merge agent-based performances into MIDI file (if available)
+    # Agent tracks are added alongside standard generated tracks
+    if agent_performances:
+        try:
+            import mido
+            
+            # Load the generated MIDI to merge agent tracks
+            temp_path = output_dir / "_temp_midi_for_merge.mid"
+            midi_file.save(str(temp_path))
+            mid = mido.MidiFile(str(temp_path))
+            normalized_agent_performances = _normalize_agent_performances(agent_performances)
+            merged_track_count = 0
+            
+            for perf in normalized_agent_performances:
+                agent_name = perf.get('agent_name', 'Agent')
+                notes = list(perf.get('notes') or [])
+                channel = int(perf.get('channel', 0) or 0)
+                program = int(perf.get('program', 0) or 0)
+                
+                if not notes:
+                    continue
+                
+                # Create MIDI track for this agent
+                track = mido.MidiTrack()
+                track.name = agent_name
+                
+                # Convert to MIDI messages with delta times
+                messages = []
+                used_channels = set()
+                for note in notes:
+                    tick, pitch, vel, dur, note_channel = _extract_agent_note_payload(note, channel)
+                    used_channels.add(note_channel)
+                    messages.append(('note_on', tick, pitch, vel, note_channel))
+                    messages.append(('note_off', tick + dur, pitch, 0, note_channel))
+
+                if not messages:
+                    continue
+
+                for program_channel in sorted(used_channels or {channel}):
+                    track.append(mido.Message('program_change', channel=program_channel, program=program, time=0))
+                
+                # Sort all messages by time
+                messages.sort(key=lambda m: (m[1], 0 if m[0] == 'note_off' else 1, m[2], m[4]))
+                
+                # Convert to delta times
+                last_tick = 0
+                for msg_type, abs_tick, pitch, vel, chan in messages:
+                    delta = abs_tick - last_tick
+                    if msg_type == 'note_on':
+                        track.append(mido.Message('note_on', note=pitch, velocity=vel, channel=chan, time=delta))
+                    else:
+                        track.append(mido.Message('note_off', note=pitch, velocity=0, channel=chan, time=delta))
+                    last_tick = abs_tick
+                
+                mid.tracks.append(track)
+                merged_track_count += 1
+                if verbose:
+                    print_info(f"  Added agent track: {agent_name} ({len(notes)} notes)")
+            
+            # Save merged file back
+            mid.save(str(temp_path))
+            
+            # Reload as MidiFile for the rest of the pipeline
+            midi_file = mido.MidiFile(str(temp_path))
+            
+            # Clean up temp file
+            try:
+                temp_path.unlink()
+            except:
+                pass
+            
+            print_success(f"Merged {merged_track_count} agent performances into MIDI")
+            
+        except Exception as e:
+            print_warning(f"Failed to merge agent performances: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+    
+    # Save MIDI file
+    project_name = generate_project_name(parsed)
+    midi_path = output_dir / f"{project_name}.mid"
+    midi_file.save(str(midi_path))
+    results["midi"] = str(midi_path)
+    print_success(f"MIDI saved: {midi_path.name}")
+    
+    # Step 3.5: Generate Alternative Takes
+    # Industry-standard overdubbing: Takes REPLACE original tracks, not layer on top
+    # When --takes N is specified, original tracks become the "reference" and
+    # take tracks are the playable alternatives (user selects which to use in DAW)
+    if takes > 0:
+        print_step("3.5/6", f"Generating {takes} alternative takes per track...")
+        try:
+            import mido
+            from multimodal_gen.take_generator import (
+                take_to_midi_track, TakeValidator, TakeMode, NoteVariation
+            )
+            
+            # Load the generated MIDI file
+            mid = mido.MidiFile(str(midi_path))
+            new_tracks = []
+            tracks_to_remove = []  # Original tracks to mark/remove
+            take_gen = TakeGenerator()
+            validator = TakeValidator()
+            
+            # Iterate over tracks (skip Meta)
+            for i, track in enumerate(mid.tracks):
+                track_name = track.name.strip()
+                if track_name in ["Meta", "Tempo", "Time Signature"] or not track_name:
+                    continue
+                    
+                # Determine role from track name
+                role = "lead" # Default
+                if "Drums" in track_name: role = "drums"
+                elif "Bass" in track_name: role = "bass"
+                elif "Chords" in track_name: role = "chords"
+                elif "Melody" in track_name: role = "lead"
+                elif "Organ" in track_name: role = "pad"
+                
+                # Parse track to notes
+                track_notes = []
+                active_notes = {} # pitch -> start_tick
+                curr_tick = 0
+                
+                for msg in track:
+                    curr_tick += msg.time
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        active_notes[msg.note] = (curr_tick, msg.velocity, msg.channel)
+                    elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
+                        if msg.note in active_notes:
+                            start, vel, chan = active_notes.pop(msg.note)
+                            duration = curr_tick - start
+                            track_notes.append({
+                                "pitch": msg.note,
+                                "start_tick": start,
+                                "duration_ticks": duration,
+                                "velocity": vel,
+                                "channel": chan
+                            })
+                
+                if not track_notes:
+                    continue
+                
+                # Mark original track for removal (overdub = replace, not layer)
+                tracks_to_remove.append(i)
+                    
+                # Generate takes (these REPLACE the original)
+                # Use timestamp-based seed if no seed provided to ensure uniqueness per request
+                import time
+                if seed is not None:
+                    take_seed = seed + i  # User-provided seed: deterministic per track
+                else:
+                    # No seed: use timestamp for uniqueness between requests
+                    take_seed = int(time.time() * 1000) % (2**31) + i
+                
+                take_set = take_gen.generate_takes_for_role(
+                    notes=track_notes,
+                    role=role,
+                    num_takes=takes,
+                    genre=parsed.genre,
+                    base_seed=take_seed
+                )
+                
+                # Convert original notes for validation
+                original_note_vars = [
+                    NoteVariation(
+                        pitch=n["pitch"],
+                        start_tick=n["start_tick"],
+                        duration_ticks=n["duration_ticks"],
+                        velocity=n["velocity"],
+                        channel=n.get("channel", 0)
+                    ) for n in track_notes
+                ]
+                
+                for take in take_set.takes:
+                    # Validate take correctness
+                    validation = validator.validate_take(
+                        take, original_note_vars, parsed.genre
+                    )
+                    
+                    # Set relationship metadata
+                    take.original_track_name = track_name
+                    take.is_active_take = (take.take_id == 0)  # First take is default active
+                    
+                    # Name the track: "OriginalName_Take_N"
+                    take.midi_track_name = f"{track_name}_Take_{take.take_id + 1}"
+                    new_track = take_to_midi_track(take)
+                    new_tracks.append(new_track)
+                    
+                    # Add to results for reporting (rich data for TakeLanePanel)
+                    if track_name not in results["takes"]:
+                        results["takes"][track_name] = []
+                    results["takes"][track_name].append({
+                        "take_id": str(take.take_id + 1),
+                        "midi_track_name": take.midi_track_name,
+                        "variation_type": take.variation_type,
+                        "seed": take.seed,
+                        "notes_count": len(take.notes),
+                        "notes_added": take.notes_added,
+                        "notes_removed": take.notes_removed,
+                        "notes_modified": take.notes_modified,
+                        "notes_kept": take.notes_kept,
+                        "avg_timing_shift": take.avg_timing_shift,
+                        "original_track": track_name,
+                        "is_active": take.is_active_take,
+                        "validation_score": validation.score,
+                        "validation_issues": validation.issues,
+                        "validation_warnings": validation.warnings,
+                    })
+                    
+                    # Log validation results
+                    if verbose and (validation.issues or validation.warnings):
+                        if validation.issues:
+                            print_warning(f"  Take {take.take_id + 1}: {validation.issues}")
+                        if validation.warnings:
+                            print_info(f"  Take {take.take_id + 1}: {validation.warnings}")
+                    
+                    # Update SessionGraph if available
+                    if session_graph:
+                        # Find the track in the graph
+                        graph_track = next((t for t in session_graph.tracks if t.name == track_name), None)
+                        if graph_track:
+                            # Add takes to all clips in this track (simplification)
+                            for clip in graph_track.clips:
+                                clip.add_take_lane(
+                                    take_id=take.take_id + 1,
+                                    seed=take.seed,
+                                    variation_type=take.variation_type,
+                                    midi_track_name=take.midi_track_name,
+                                    notes_count=len(take.notes),
+                                    notes_added=take.notes_added,
+                                    notes_modified=take.notes_modified,
+                                    avg_timing_shift=take.avg_timing_shift,
+                                    parameters=take.parameters
+                                )
+
+            # OVERDUBBING FIX: Remove original tracks and add takes as replacements
+            # This is industry-standard behavior - takes are alternatives, not layers
+            if new_tracks:
+                # Create new MIDI file with takes replacing originals
+                new_mid = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
+                
+                for i, track in enumerate(mid.tracks):
+                    if i in tracks_to_remove:
+                        # Skip original - it's being replaced by takes
+                        continue
+                    new_mid.tracks.append(track)
+                
+                # Add all take tracks
+                new_mid.tracks.extend(new_tracks)
+                new_mid.save(str(midi_path))
+                
+                print_success(
+                    f"Generated {len(new_tracks)} take tracks "
+                    f"(replaced {len(tracks_to_remove)} original tracks)"
+                )
+            
+        except Exception as e:
+            print_warning(f"Take generation failed: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+
+    # Step 3.6: Generate Comp Tracks from Takes
+    # Industry-standard comping: combine best sections from each take
+    if comp and takes >= 2:
+        print_step("3.6/6", f"Generating comp tracks ({comp_bars} bars per section)...")
+        try:
+            import mido
+            from multimodal_gen.take_generator import (
+                CompGenerator, comp_to_midi_track, TakeLane, NoteVariation
+            )
+            
+            # Load the MIDI file with takes
+            mid = mido.MidiFile(str(midi_path))
+            comp_tracks = []
+            comp_gen = CompGenerator()
+            
+            # Group takes by original track
+            takes_by_track = {}  # original_track_name -> list of (track, TakeLane)
+            
+            for track in mid.tracks:
+                track_name = track.name.strip()
+                # Identify take tracks by naming convention: "OriginalName_Take_N"
+                if "_Take_" in track_name:
+                    parts = track_name.rsplit("_Take_", 1)
+                    original_name = parts[0]
+                    take_num = int(parts[1]) - 1  # 0-indexed
+                    
+                    # Parse track notes
+                    track_notes = []
+                    active_notes = {}
+                    curr_tick = 0
+                    
+                    for msg in track:
+                        curr_tick += msg.time
+                        if msg.type == 'note_on' and msg.velocity > 0:
+                            active_notes[msg.note] = (curr_tick, msg.velocity, getattr(msg, 'channel', 0))
+                        elif (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0):
+                            if msg.note in active_notes:
+                                start, vel, chan = active_notes.pop(msg.note)
+                                duration = curr_tick - start
+                                track_notes.append(NoteVariation(
+                                    pitch=msg.note,
+                                    start_tick=start,
+                                    duration_ticks=duration,
+                                    velocity=vel,
+                                    channel=chan,
+                                ))
+                    
+                    if track_notes:
+                        # Determine role from original name
+                        role = "lead"
+                        if "Drums" in original_name: role = "drums"
+                        elif "Bass" in original_name: role = "bass"
+                        elif "Chords" in original_name: role = "chords"
+                        elif "Melody" in original_name: role = "lead"
+                        elif "Organ" in original_name: role = "pad"
+                        
+                        # Create TakeLane
+                        take_lane = TakeLane(
+                            take_id=take_num,
+                            seed=0,  # Not needed for comping
+                            variation_type="combined",
+                            notes=track_notes,
+                            midi_track_name=track_name,
+                            original_track_name=original_name,
+                            parameters={"role": role},
+                        )
+                        
+                        if original_name not in takes_by_track:
+                            takes_by_track[original_name] = []
+                        takes_by_track[original_name].append(take_lane)
+            
+            # Generate comp for each track's takes
+            for original_name, take_lanes in takes_by_track.items():
+                if len(take_lanes) < 2:
+                    continue  # Need at least 2 takes to comp
+                
+                role = take_lanes[0].parameters.get("role", "lead")
+                
+                # Generate comp
+                comp_result = comp_gen.generate_comp_from_takes(
+                    takes=take_lanes,
+                    role=role,
+                    bars_per_section=comp_bars,
+                    genre=parsed.genre,
+                )
+                
+                # Set track names
+                comp_result.midi_track_name = f"{original_name}_Comp"
+                comp_result.original_track_name = original_name
+                
+                # Convert to MIDI track
+                comp_track = comp_to_midi_track(comp_result)
+                comp_tracks.append(comp_track)
+                
+                # Store comp info in results
+                results["comps"][original_name] = comp_result.to_dict()
+                
+                if verbose:
+                    print_info(
+                        f"  {original_name}: {comp_result.num_sections} sections from "
+                        f"{len(comp_result.takes_used)} takes, score {comp_result.total_score:.2f}"
+                    )
+            
+            # Add comp tracks to MIDI file
+            if comp_tracks:
+                for comp_track in comp_tracks:
+                    mid.tracks.append(comp_track)
+                mid.save(str(midi_path))
+                
+                print_success(f"Generated {len(comp_tracks)} comp tracks")
+            
+        except Exception as e:
+            print_warning(f"Comp generation failed: {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+    elif comp and takes < 2:
+        print_warning("Comp requires --takes >= 2 (need multiple takes to comp from)")
+
+    # Step 4: Generate procedural samples
+    print_step("4/6", "Generating procedural samples...")
+    report_progress("generating_samples", 0.45, "Generating procedural samples...")
+    assets_gen = AssetsGenerator(str(output_dir / "samples"))
+    
+    try:
+        drum_samples = assets_gen.generate_drum_kit(parsed.drum_elements)
+        results["samples"].extend(drum_samples.values())
+        print_success(f"Generated {len(drum_samples)} drum samples")
+        
+        # Generate textures if needed
+        if "vinyl" in parsed.textures or "lofi" in parsed.genre:
+            vinyl_path = assets_gen.generate_vinyl_crackle()
+            results["samples"].append(vinyl_path)
+            print_success("Generated vinyl crackle texture")
+            
+        if "rain" in parsed.textures or "ambient" in parsed.mood:
+            rain_path = assets_gen.generate_rain_texture()
+            results["samples"].append(rain_path)
+            print_success("Generated rain texture")
+            
+    except Exception as e:
+        print_warning(f"Sample generation issue: {e}")
+    
+    # Step 4.5: Discover and analyze instruments (if paths provided or default exists)
+    default_instruments = Path(__file__).parent / "instruments"
+    
+    # Auto-load from default instruments directory if no explicit path provided
+    if not skip_default_instruments and not instruments_paths and default_instruments.exists() and any(default_instruments.iterdir()):
+        instruments_paths = [str(default_instruments)]
+        print_info(f"Auto-loading instruments from {default_instruments}")
+    elif skip_default_instruments and not instruments_paths and verbose:
+        print_info("Skipping default instruments auto-load (--skip-default-instruments)")
+    
+    if instruments_paths:
+        print_step("4.5/6", "Discovering and analyzing instruments...")
+        report_progress("discovering_instruments", 0.55, "Discovering and analyzing instruments...")
+        try:
+            from multimodal_gen import InstrumentLibrary, InstrumentMatcher, load_multiple_libraries
+            
+            # Handle multiple instrument sources
+            if len(instruments_paths) == 1:
+                # Single source - use original logic with caching
+                single_path = instruments_paths[0]
+                instruments_path_obj = Path(single_path)
+                try:
+                    cache_file = str(instruments_path_obj / ".instrument_cache.json")
+                    test_file = instruments_path_obj / ".write_test"
+                    test_file.touch()
+                    test_file.unlink()
+                except (PermissionError, OSError):
+                    cache_name = instruments_path_obj.name.replace("[", "").replace("]", "")
+                    cache_file = str(output_dir / f".instrument_cache_{cache_name}.json")
+                    if verbose:
+                        print_info(f"Using local cache (source is read-only)")
+                
+                instrument_library = InstrumentLibrary(
+                    instruments_dir=single_path,
+                    cache_file=cache_file,
+                    auto_load_audio=True
+                )
+                count = instrument_library.discover_and_analyze()
+            else:
+                # Multiple sources - use load_multiple_libraries
+                print_info(f"Loading {len(instruments_paths)} instrument sources...")
+                
+                # Use output directory for caches (handles read-only sources)
+                instrument_library = load_multiple_libraries(
+                    instruments_paths,
+                    cache_dir=str(output_dir),
+                    auto_load_audio=True,
+                    verbose=verbose
+                )
+                count = len(instrument_library.instruments)
+                
+                # Show per-source breakdown
+                if verbose:
+                    summary = instrument_library.get_source_summary()
+                    for source, src_count in summary.items():
+                        print_info(f"  {Path(source).name}: {src_count} instruments")
+            
+            if count > 0:
+                print_success(f"Discovered {count} instruments total")
+                
+                # Show category breakdown
+                categories = instrument_library.list_categories()
+                if verbose and categories:
+                    for cat, cnt in categories.items():
+                        print_info(f"  {cat}: {cnt} samples")
+                
+                # Get recommendations for this genre
+                matcher = InstrumentMatcher(instrument_library)
+                recommendations = matcher.get_recommendations(parsed.genre, parsed.mood)
+
+                if recommendations:
+                    if verbose:
+                        print_info("Instrument recommendations:")
+                    for cat, matches in recommendations.items():
+                        if matches:
+                            # If the prompt intentionally suppresses drums (ambient/cinematic defaults),
+                            # don't attach drum sample recommendations to instruments_used. This prevents
+                            # downstream auto-mapping from assigning drum samples to melodic tracks.
+                            if (not getattr(parsed, "allow_default_drums", True)) and (not getattr(parsed, "drum_elements", [])):
+                                if cat in {"kick", "snare", "hihat", "clap", "tom", "perc", "808"}:
+                                    continue
+                            best, score = matches[0]
+                            # Show source for multi-source setups
+                            source_info = ""
+                            if len(instruments_paths) > 1 and hasattr(best, 'source'):
+                                source_info = f" [{Path(best.source).name}]"
+                            if verbose:
+                                print_info(f"  {cat}: {best.name}{source_info} ({score:.0%} match)")
+                            results["instruments_used"].append({
+                                "category": cat,
+                                "name": best.name,
+                                "score": score,
+                                "path": best.path,
+                                "source": getattr(best, 'source', None),
+                            })
+                # Chat/GUI robustness: if we only discovered drum categories (common when the client sends
+                # narrow instrumentPaths), append a minimal melodic palette using the expansion registry.
+                melodic_categories = {"pad", "strings", "keys", "synth", "brass", "bass", "fx", "choir"}
+                have_categories = {str(i.get("category", "")).lower() for i in results.get("instruments_used", []) if isinstance(i, dict)}
+                if instrument_service and not (have_categories & melodic_categories):
+                    fallback_queries = [
+                        ("pad", "pad"),
+                        ("strings", "strings"),
+                        ("keys", "piano"),
+                        ("synth", "synth"),
+                        ("brass", "brass"),
+                        ("bass", "bass"),
+                        ("choir", "choir"),
+                        ("fx", "fx"),
+                    ]
+                    for category, query in fallback_queries:
+                        if category in have_categories:
+                            continue
+                        try:
+                            resolved = instrument_service.resolve_instrument(query, genre=parsed.genre or "")
+                            sample_paths = getattr(resolved, "sample_paths", []) or []
+                            if not sample_paths:
+                                continue
+                            results["instruments_used"].append({
+                                "category": category,
+                                "name": getattr(resolved, "name", query),
+                                "score": float(getattr(resolved, "confidence", 0.5)),
+                                "path": sample_paths[0],
+                                "source": getattr(resolved, "source", None),
+                            })
+                            have_categories.add(category)
+                        except Exception:
+                            continue
+            else:
+                print_warning("No instruments found in specified directories")
+                instrument_library = None
+                
+        except ImportError as e:
+            print_warning(f"Instrument analysis requires librosa: {e}")
+            print_info("Install with: pip install librosa")
+            instrument_library = None
+        except Exception as e:
+            print_warning(f"Instrument discovery failed: {e}")
+            instrument_library = None
+    
+    # Step 4.7: Expansion packs already loaded in Step 2.6 (before MIDI generation)
+    # This step is now a no-op but kept for documentation and backward compatibility
+    # expansion_manager and instrument_service are already set from earlier initialization
+    
+    # Step 4.8: Adjective-aware smart instrument metadata is unavailable in this build.
+    # Live generation already continues through InstrumentResolutionService above,
+    # so fail open honestly instead of importing the archived instrument_index path.
+    if parsed.sonic_adjectives and expansion_manager and verbose:
+        print_warning(
+            "Adjective-aware smart instrument metadata is unavailable in this build; "
+            "continuing with the supported live instrument resolver flow."
+        )
+
+    instrument_patches = enrich_instrument_patches_with_resolved_samples(
+        instrument_patches,
+        results.get("instruments_used", []),
+    )
+    results["instrument_patches"] = [patch.to_dict() for patch in instrument_patches]
+
+    # Step 5: Render audio
+    print_step("5/6", "Rendering audio...")
+    report_progress("rendering_audio", 0.75, "Rendering audio...")
+    
+    # Prepare AI metadata for BWF
+    ai_metadata = {
+        'version': '0.2.0',
+        'prompt': prompt,
+        'seed': seed,
+        'bpm': parsed.bpm,
+        'key': parsed.key,
+        'genre': parsed.genre,
+        'ethiopian_mp3_reference_profiles': _prompt_requests_ethiopian_mp3_reference_profiles(prompt),
+        'synthesis_params': results.get('synthesis_params', {}),
+    }
+    
+    renderer = AudioRenderer(
+        soundfont_path=soundfont_path,
+        require_soundfont=require_soundfont,
+        instrument_library=instrument_library,
+        expansion_manager=expansion_manager,
+        instrument_service=instrument_service,
+        genre=parsed.genre,
+        mood=parsed.mood,
+        use_bwf=use_bwf,
+        ai_metadata=ai_metadata,
+        parsed_instruments=parsed.instruments + parsed.drum_elements,  # Pass explicit instruments
+        resolved_sample_metadata=results.get("instruments_used", []),
+        ethiopian_mp3_reference_profiles=_prompt_requests_ethiopian_mp3_reference_profiles(prompt),
+        prefer_ethiopian_samples=_prefer_ethiopian_samples_for_generation(
+            parsed.genre, parsed.instruments, prompt
+        ),
+    )
+
+    # Sprint 8.3: Bridge reference profile to renderer for mix matching
+    try:
+        _ref_profile = results.get("_reference_profile_obj")
+        if _ref_profile is not None:
+            renderer.set_reference_profile(_ref_profile)
+    except Exception:
+        pass  # Graceful degradation — reference matching remains dormant
+
+    # Sprint 8.4: Forward MixPolicy panning to renderer
+    if policy_context and hasattr(policy_context, 'mix') and policy_context.mix:
+        try:
+            renderer.set_mix_policy(policy_context.mix)
+        except Exception:
+            pass  # Graceful degradation — use default panning
+
+    # Sprint 8.7: Forward production preset values to renderer for mix influence
+    if preset_values:
+        try:
+            renderer.set_preset_values(preset_values)
+        except Exception:
+            pass  # Graceful degradation — render uses defaults
+
+    try:
+        audio_path = output_dir / f"{project_name}.wav"
+        # render_midi_file takes file path, not MidiFile object
+        success = renderer.render_midi_file(str(midi_path), str(audio_path), parsed)
+        if success:
+            results["audio"] = str(audio_path)
+            print_success(f"Audio saved: {audio_path.name}")
+        else:
+            render_report = renderer.get_last_render_report() if hasattr(renderer, "get_last_render_report") else None
+            render_failure = _get_render_failure_details(render_report)
+            if render_failure:
+                failure_reason = render_failure.get("reason") or "render_failed"
+                failure_stage = render_failure.get("stage") or ((render_report or {}).get("render_status") or {}).get("current_stage")
+                if failure_stage:
+                    print_warning(f"Audio rendering returned no output ({failure_reason} @ {failure_stage})")
+                else:
+                    print_warning(f"Audio rendering returned no output ({failure_reason})")
+            elif require_soundfont:
+                print_warning("Audio rendering returned no output (SoundFont required)")
+            else:
+                print_warning("Audio rendering returned no output (FluidSynth may not be available)")
+
+        results.update(
+            _persist_render_diagnostics(
+                renderer,
+                output_dir,
+                project_name,
+                render_success=success,
+            )
+        )
+        
+        # Export stems if requested
+        if export_stems:
+            print_info("Exporting stems...")
+            report_progress("exporting_stems", 0.85, "Exporting stems...")
+            stems_dir = output_dir / f"{project_name}_stems"
+            stem_paths = renderer.render_stems(str(midi_path), str(stems_dir), parsed)
+            results["stems"] = stem_paths
+            print_success(f"Exported {len(stem_paths)} stems to {stems_dir.name}/")
+            if session_graph:
+                try:
+                    session_graph.stems_path = str(stems_dir.relative_to(output_dir))
+                except ValueError:
+                    session_graph.stems_path = str(stems_dir)
+            
+    except Exception as e:
+        results.update(
+            _persist_render_diagnostics(
+                renderer,
+                output_dir,
+                project_name,
+                error=e,
+            )
+        )
+        print_warning(f"Audio rendering issue: {e}")
+        print_info("Audio rendering skipped - MIDI file still available")
+
+    # Post-generation file analysis (Sprint 7.5)
+    if verbose and _HAS_FILE_ANALYSIS and results.get("audio"):
+        try:
+            fa_result = file_analyze_path(results["audio"], request_id="post_gen")
+            print(f"  File analysis: {fa_result.duration_seconds:.1f}s, "
+                  f"{fa_result.extra.get('sample_rate', 'n/a')} Hz, "
+                  f"{Path(results['audio']).suffix.lstrip('.')} format")
+        except Exception:
+            pass
+
+    # Step 6: Export to MPC (optional)
+    if export_mpc:
+        print_step("6/6", "Exporting to MPC format...")
+        report_progress("exporting_mpc", 0.95, "Exporting to MPC format...")
+        mpc_dir = output_dir / f"{project_name}_mpc"
+        
+        try:
+            exporter = MpcExporter(str(mpc_dir))
+            mpc_path = exporter.export_midi_to_mpc(
+                midi_file,
+                project_name,
+                sample_paths=results["samples"],
+                bpm=parsed.bpm,
+            )
+            results["mpc"] = mpc_path
+            print_success(f"MPC project saved: {mpc_dir.name}/")
+            
+        except Exception as e:
+            print_warning(f"MPC export issue: {e}")
+    else:
+        print_step("6/6", "MPC export skipped (use --mpc to enable)")
+    
+    # Report completion
+    report_progress("complete", 1.0, "Generation complete!")
+    
+    # Add metadata to results for server mode
+    results["bpm"] = parsed.bpm
+    results["key"] = parsed.key
+    results["genre"] = parsed.genre
+    results["sections"] = [
+        {"name": s.section_type.value, "bars": s.bars}
+        for s in arrangement.sections
+    ] if 'arrangement' in dir() else []
+    
+    # Step 5.5: Save Session Manifest
+    if session_graph:
+        print_step("5.5/6", "Saving session manifest...")
+        try:
+            # Update graph with generated file paths
+            if midi_path:
+                try:
+                    session_graph.midi_path = str(midi_path.relative_to(output_dir))
+                except ValueError:
+                    session_graph.midi_path = str(midi_path)
+            
+            if results['audio']:
+                try:
+                    session_graph.audio_path = str(Path(results['audio']).relative_to(output_dir))
+                except ValueError:
+                    session_graph.audio_path = str(results['audio'])
+            
+            # Save manifest
+            manifest_path = output_dir / "session_manifest.json"
+            session_graph.save_manifest(str(manifest_path))
+            print_success(f"Session manifest saved: {manifest_path.name}")
+            
+            # Add to results
+            results["manifest"] = str(manifest_path)
+            
+        except Exception as e:
+            print_warning(f"Failed to save session manifest: {e}")
+
+    # Sprint 9.4: Stash MixPolicy and preset values for CLI re-render path
+    if policy_context and hasattr(policy_context, 'mix') and policy_context.mix:
+        results["_mix_policy_obj"] = policy_context.mix
+    if preset_values:
+        results["_preset_values"] = preset_values
+
+    # Persist project metadata for both CLI and server flows so JUCE can build
+    # stable titles/tooltips from project_metadata.json (generation_history).
+    try:
+        metadata_path = save_project_metadata(
+            output_dir=output_dir,
+            prompt=base_prompt or prompt,
+            results=results,
+            parsed=parsed,
+            seed=seed,
+            synthesis_params=results.get("synthesis_params"),
+        )
+        results["project_metadata"] = str(metadata_path)
+    except Exception:
+        # Metadata persistence should never break generation.
+        pass
+
+    return results
+
+
+def save_project_metadata(
+    output_dir: Path,
+    prompt: str,
+    results: dict,
+    parsed: ParsedPrompt,
+    seed: Optional[int] = None,
+    synthesis_params: Optional[dict] = None
+):
+    """
+    Save comprehensive project metadata as JSON with support for iterative refinement.
+    
+    Enhanced to include:
+    - Seed value for reproducibility
+    - ADSR parameters for each synthesized sound
+    - Duty cycle and waveform type for each element
+    - Synthesis parameter history for non-deterministic iteration
+    """
+    # Load existing metadata if present (for refinement tracking)
+    metadata_path = output_dir / "project_metadata.json"
+    history = []
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r') as f:
+                existing = json.load(f)
+                history = existing.get('generation_history', [])
+        except:
+            pass
+    
+    # Create current generation record
+    current_generation = {
+        "prompt": prompt,
+        "parsed": {
+            "bpm": parsed.bpm,
+            "key": parsed.key,
+            "scale": parsed.scale_type.name.lower(),
+            "genre": parsed.genre,
+            "style_modifiers": parsed.style_modifiers,
+            "instruments": parsed.instruments,
+            "drum_elements": parsed.drum_elements,
+            "textures": parsed.textures,
+            "mood": parsed.mood,
+            "energy": parsed.energy,
+        },
+        "outputs": results,
+        "generated_at": datetime.now().isoformat(),
+        "seed": seed,  # For reproducibility
+        "synthesis_params": synthesis_params or {},  # ADSR, waveforms, duty cycles
+    }
+    
+    # Add to history
+    history.append(current_generation)
+    
+    # Complete metadata structure
+    metadata = {
+        "version": "0.2.0",  # Updated version with persistence features
+        "current": current_generation,
+        "generation_history": history,
+        "refinement_capable": True,  # Indicates support for iterative refinement
+        "original_seed": history[0].get('seed') if history else seed,  # Preserve original "soul"
+    }
+
+    metadata = _build_json_export_view(metadata, omit_private_keys=True)
+
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    return metadata_path
+
+
+def load_project_metadata(metadata_path: str | Path) -> Optional[dict]:
+    """
+    Load project metadata from JSON file.
+    
+    Returns:
+        Metadata dictionary or None if not found
+    """
+    metadata_path = Path(metadata_path)
+    
+    if not metadata_path.exists():
+        return None
+    
+    try:
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading metadata: {e}")
+        return None
+
+
+def refine_generation(
+    metadata_path: str | Path,
+    refinement_prompt: str,
+    output_dir: Optional[Path] = None,
+    **override_params
+) -> dict:
+    """
+    Refine a previous generation using its original seed and parameters.
+    
+    This implements the "non-deterministic iteration" feature where users
+    can provide follow-up prompts like "make the snare punchier" and the AI
+    will use the original seed to maintain the "soul" of the track while
+    modifying specific parameters.
+    
+    Args:
+        metadata_path: Path to project_metadata.json
+        refinement_prompt: Follow-up prompt (e.g., "make snare punchier")
+        output_dir: Output directory (defaults to same as original)
+        **override_params: Specific parameters to override
+        
+    Returns:
+        Results dictionary from refined generation
+    """
+    # Load original metadata
+    metadata = load_project_metadata(metadata_path)
+    if not metadata:
+        raise FileNotFoundError(f"Metadata not found: {metadata_path}")
+    
+    # Get original seed to preserve "soul"
+    original_seed = metadata.get('original_seed')
+    current = metadata.get('current', {})
+    
+    # Determine output directory
+    if output_dir is None:
+        output_dir = Path(metadata_path).parent
+    
+    # Merge original prompt with refinement
+    original_prompt = current.get('prompt', '')
+    combined_prompt = f"{original_prompt} {refinement_prompt}"
+    
+    # Extract original parameters
+    parsed_data = current.get('parsed', {})
+    
+    # Apply overrides
+    for key, value in override_params.items():
+        if key in parsed_data:
+            parsed_data[key] = value
+    
+    # Run generation with original seed
+    print(f"Refining generation with original seed: {original_seed}")
+    print(f"Refinement prompt: {refinement_prompt}")
+    
+    results = run_generation(
+        prompt=combined_prompt,
+        output_dir=output_dir,
+        bpm_override=override_params.get('bpm', parsed_data.get('bpm')),
+        key_override=override_params.get('key', parsed_data.get('key')),
+        **{k: v for k, v in override_params.items() if k not in ['bpm', 'key']}
+    )
+    
+    return results
+
+
+def extract_refinement_intent(refinement_prompt: str) -> dict:
+    """
+    Parse refinement prompt to extract specific modification intent.
+    
+    Examples:
+        "make the snare punchier" -> {'element': 'snare', 'adjustment': 'punchier'}
+        "extend the outro" -> {'section': 'outro', 'adjustment': 'extend'}
+        "add more bass" -> {'element': 'bass', 'adjustment': 'more'}
+    
+    Returns:
+        Dictionary with refinement parameters
+    """
+    refinement = {
+        'intent': 'general',
+        'element': None,
+        'section': None,
+        'adjustment': None,
+    }
+    
+    prompt_lower = refinement_prompt.lower()
+    
+    # Detect elements
+    elements = ['snare', 'kick', 'bass', '808', 'hihat', 'hi-hat', 'clap', 'piano', 'rhodes']
+    for element in elements:
+        if element in prompt_lower:
+            refinement['element'] = element
+            refinement['intent'] = 'element_modification'
+            break
+    
+    # Detect sections
+    sections = ['intro', 'verse', 'chorus', 'drop', 'outro', 'bridge']
+    for section in sections:
+        if section in prompt_lower:
+            refinement['section'] = section
+            refinement['intent'] = 'section_modification'
+            break
+    
+    # Detect adjustments
+    if any(word in prompt_lower for word in ['punchier', 'harder', 'louder', 'more']):
+        refinement['adjustment'] = 'increase'
+    elif any(word in prompt_lower for word in ['softer', 'quieter', 'less', 'subtle']):
+        refinement['adjustment'] = 'decrease'
+    elif any(word in prompt_lower for word in ['extend', 'longer']):
+        refinement['adjustment'] = 'extend'
+    elif any(word in prompt_lower for word in ['shorten', 'shorter']):
+        refinement['adjustment'] = 'shorten'
+    
+    return refinement
+
+
+def show_generation_history(output_dir: Path) -> bool:
+    """
+    Display generation history for A/B comparison.
+    
+    Phase A3: Prompt history + A/B comparison
+    Shows all generations with their prompt, seed, key details.
+    
+    Args:
+        output_dir: Directory containing project_metadata.json
+        
+    Returns:
+        True if history found and displayed
+    """
+    metadata_path = output_dir / "project_metadata.json"
+    metadata = load_project_metadata(metadata_path)
+    
+    if not metadata:
+        print_error(f"No generation history found at {metadata_path}")
+        return False
+    
+    history = metadata.get('generation_history', [])
+    if not history:
+        print_info("No generation history available.")
+        return True
+    
+    print(f"\n{Fore.CYAN}Generation History ({len(history)} versions){Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
+    
+    for i, gen in enumerate(history, 1):
+        prompt = gen.get('prompt', 'N/A')
+        parsed = gen.get('parsed', {})
+        outputs = gen.get('outputs', {})
+        generated_at = gen.get('generated_at', 'N/A')
+        seed = gen.get('seed', 'N/A')
+        
+        bpm = parsed.get('bpm', 'N/A')
+        key = f"{parsed.get('key', '?')}{parsed.get('scale', '?')[:3]}"
+        genre = parsed.get('genre', 'N/A')
+        
+        # Take info
+        takes = outputs.get('takes', {})
+        take_count = sum(len(t) for t in takes.values()) if takes else 0
+        
+        # Comp info
+        comps = outputs.get('comps', {})
+        comp_count = len(comps) if comps else 0
+        
+        # Validation status
+        all_valid = True
+        if takes:
+            for track_takes in takes.values():
+                for take in track_takes:
+                    # Handle both dict format (new) and string format (legacy)
+                    if isinstance(take, dict) and take.get('validation_issues'):
+                        all_valid = False
+                        break
+        
+        validation_status = f"{Fore.GREEN}[VALID]{Style.RESET_ALL}" if all_valid else f"{Fore.YELLOW}[ISSUES]{Style.RESET_ALL}"
+        
+        print(f"  {Fore.WHITE}Version {i}{Style.RESET_ALL} ({generated_at[:19] if len(generated_at) > 19 else generated_at})")
+        print(f"    Prompt: \"{prompt[:50]}{'...' if len(prompt) > 50 else ''}\"")
+        print(f"    BPM: {bpm}, Key: {key}, Genre: {genre}")
+        
+        # Show takes and comps info
+        if comp_count > 0:
+            print(f"    Seed: {seed}, Takes: {take_count}, Comps: {comp_count} {validation_status}")
+        else:
+            print(f"    Seed: {seed}, Takes: {take_count} {validation_status}")
+        
+        if outputs.get('midi'):
+            print(f"    MIDI: {Path(outputs['midi']).name}")
+        if outputs.get('audio'):
+            print(f"    Audio: {Path(outputs['audio']).name}")
+        print()
+    
+    print(f"{Fore.CYAN}Use --compare <A> <B> to compare two versions{Style.RESET_ALL}")
+    return True
+
+
+def compare_versions(output_dir: Path, ver_a: int, ver_b: int) -> bool:
+    """
+    Compare two generation versions for A/B evaluation.
+    
+    Phase A3: Enables blind A/B comparison workflow.
+    
+    Args:
+        output_dir: Directory containing project_metadata.json
+        ver_a: First version number (1-indexed)
+        ver_b: Second version number (1-indexed)
+        
+    Returns:
+        True if comparison successful
+    """
+    metadata_path = output_dir / "project_metadata.json"
+    metadata = load_project_metadata(metadata_path)
+    
+    if not metadata:
+        print_error(f"No metadata found at {metadata_path}")
+        return False
+    
+    history = metadata.get('generation_history', [])
+    
+    # Validate version indices
+    if ver_a < 1 or ver_a > len(history):
+        print_error(f"Version {ver_a} not found (have {len(history)} versions)")
+        return False
+    if ver_b < 1 or ver_b > len(history):
+        print_error(f"Version {ver_b} not found (have {len(history)} versions)")
+        return False
+    
+    gen_a = history[ver_a - 1]
+    gen_b = history[ver_b - 1]
+    
+    print(f"\n{Fore.CYAN}A/B Comparison: Version {ver_a} vs Version {ver_b}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
+    
+    # Side-by-side comparison
+    headers = ["Attribute", f"Version {ver_a} (A)", f"Version {ver_b} (B)"]
+    
+    def get_val(gen, *keys):
+        val = gen
+        for k in keys:
+            val = val.get(k, {}) if isinstance(val, dict) else {}
+        return val if val != {} else 'N/A'
+    
+    comparisons = [
+        ("Prompt", gen_a.get('prompt', 'N/A')[:40], gen_b.get('prompt', 'N/A')[:40]),
+        ("BPM", get_val(gen_a, 'parsed', 'bpm'), get_val(gen_b, 'parsed', 'bpm')),
+        ("Key", f"{get_val(gen_a, 'parsed', 'key')}{get_val(gen_a, 'parsed', 'scale')[:3]}", 
+               f"{get_val(gen_b, 'parsed', 'key')}{get_val(gen_b, 'parsed', 'scale')[:3]}"),
+        ("Genre", get_val(gen_a, 'parsed', 'genre'), get_val(gen_b, 'parsed', 'genre')),
+        ("Seed", gen_a.get('seed', 'N/A'), gen_b.get('seed', 'N/A')),
+        ("Energy", get_val(gen_a, 'parsed', 'energy'), get_val(gen_b, 'parsed', 'energy')),
+        ("Mood", get_val(gen_a, 'parsed', 'mood'), get_val(gen_b, 'parsed', 'mood')),
+    ]
+    
+    # Print comparison table
+    print(f"  {'Attribute':<15} {'Version A':<25} {'Version B':<25}")
+    print(f"  {'-' * 15} {'-' * 25} {'-' * 25}")
+    
+    for attr, val_a, val_b in comparisons:
+        # Highlight differences
+        if str(val_a) != str(val_b):
+            indicator = f"{Fore.YELLOW}!{Style.RESET_ALL}"
+        else:
+            indicator = " "
+        print(f"{indicator} {attr:<15} {str(val_a):<25} {str(val_b):<25}")
+    
+    print()
+    
+    # Take comparison
+    takes_a = gen_a.get('outputs', {}).get('takes', {})
+    takes_b = gen_b.get('outputs', {}).get('takes', {})
+    
+    if takes_a or takes_b:
+        print(f"  {Fore.CYAN}Take Statistics:{Style.RESET_ALL}")
+        
+        all_tracks = set(takes_a.keys()) | set(takes_b.keys())
+        for track in sorted(all_tracks):
+            track_a = takes_a.get(track, [])
+            track_b = takes_b.get(track, [])
+            
+            # Calculate average validation score
+            score_a = sum(t.get('validation_score', 0) for t in track_a) / len(track_a) if track_a else 0
+            score_b = sum(t.get('validation_score', 0) for t in track_b) / len(track_b) if track_b else 0
+            
+            # Calculate note retention
+            kept_a = sum(t.get('notes_kept', 0) for t in track_a) if track_a else 0
+            kept_b = sum(t.get('notes_kept', 0) for t in track_b) if track_b else 0
+            
+            print(f"    {track}: A={len(track_a)} takes (score:{score_a:.2f}, kept:{kept_a}) "
+                  f"vs B={len(track_b)} takes (score:{score_b:.2f}, kept:{kept_b})")
+    
+    print()
+    
+    # Output file comparison
+    print(f"  {Fore.CYAN}Output Files:{Style.RESET_ALL}")
+    midi_a = gen_a.get('outputs', {}).get('midi')
+    midi_b = gen_b.get('outputs', {}).get('midi')
+    audio_a = gen_a.get('outputs', {}).get('audio')
+    audio_b = gen_b.get('outputs', {}).get('audio')
+    
+    if midi_a:
+        print(f"    Version A MIDI: {Path(midi_a).name}")
+    if midi_b:
+        print(f"    Version B MIDI: {Path(midi_b).name}")
+    if audio_a:
+        print(f"    Version A Audio: {Path(audio_a).name}")
+    if audio_b:
+        print(f"    Version B Audio: {Path(audio_b).name}")
+    
+    print()
+    print(f"  {Fore.GREEN}Tip: Load both audio files in a DAW for blind A/B listening test{Style.RESET_ALL}")
+    
+    return True
+
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Generate music from natural language prompts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s "dark trap soul at 87 BPM in C minor"
+  %(prog)s "lofi hip hop chill beat" --bpm 75 --key Am
+  %(prog)s "aggressive 808 trap" --mpc --stems
+  %(prog)s "ambient piano with rain" --output ./ambient_track
+  
+Reference-Based Generation (requires: pip install librosa yt-dlp):
+  %(prog)s "make a beat like this" --reference "https://youtu.be/..."
+  %(prog)s "trap beat" --reference "./my_sample.wav"
+
+Supported Genres:
+  trap, lofi, boom_bap, house, techno, ambient, drill, phonk, g_funk
+
+Audio Notes:
+  - Default: Procedural synthesis (no external dependencies)
+    - For better sound: Put a .sf2 in ./assets/soundfonts/ (auto-detected) or pass --soundfont
+    - Strict mode: Use --require-soundfont to fail instead of falling back
+        - CI smoke mode: Use --require-audio to fail when no audio artifact is produced
+  - MPC export creates [ProjectData] folder with samples
+  - Reference analysis extracts BPM, key, genre from any audio/video
+
+Intelligent Instruments (requires: pip install librosa):
+  %(prog)s "trap beat" --instruments ./instruments
+  - Analyzes samples for sonic characteristics (brightness, punch, warmth)
+  - Auto-selects best-fit samples for genre/mood
+  - Place samples in ./instruments/drums/kicks/, ./instruments/drums/snares/, etc.
+
+Server Mode (for JUCE integration):
+  %(prog)s --server [--port 9000] [--verbose]
+  - Starts OSC server for JUCE communication
+  - Receives generation requests, sends progress updates
+        """,
+    )
+    
+    # Server mode (mutually exclusive with prompt)
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Start OSC server mode for JUCE integration",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=9000,
+        help="OSC server port (default: 9000, sends responses to port+1)",
+    )
+    parser.add_argument(
+        "--no-signals",
+        action="store_true",
+        help="Disable signal handlers (useful for VS Code terminals)",
+    )
+    
+    # Positional arguments
+    parser.add_argument(
+        "prompt",
+        type=str,
+        nargs="?",  # Optional when using --server
+        help="Natural language music description (e.g., 'dark trap at 140 BPM in Am')",
+    )
+    
+    # Output options
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        default="./output",
+        help="Output directory (default: ./output)",
+    )
+    
+    # Reference analysis
+    parser.add_argument(
+        "-r", "--reference",
+        type=str,
+        help="YouTube URL or audio file path to analyze for style reference",
+    )
+    parser.add_argument(
+        "--score-plan",
+        type=str,
+        help="Path to score plan JSON (Copilot orchestration)",
+    )
+
+    # MIDI controller integration (e.g., MPC Studio)
+    parser.add_argument(
+        "--list-midi",
+        action="store_true",
+        help="List available MIDI input devices and exit",
+    )
+    parser.add_argument(
+        "--midi-in",
+        type=str,
+        default=None,
+        help="MIDI input device name (exact or substring match). Used with --record-part",
+    )
+    parser.add_argument(
+        "--record-part",
+        type=str,
+        choices=["drums", "keys", "lead"],
+        default=None,
+        help="Record a live part from a MIDI controller (replaces the generated part)",
+    )
+    parser.add_argument(
+        "--record-bars",
+        type=int,
+        default=8,
+        help="Bars to record (default: 8). Ignored if --record-seconds is set",
+    )
+    parser.add_argument(
+        "--record-seconds",
+        type=float,
+        default=None,
+        help="Seconds to record (overrides --record-bars)",
+    )
+    parser.add_argument(
+        "--count-in",
+        type=int,
+        default=1,
+        help="Count-in bars before recording starts (default: 1)",
+    )
+    parser.add_argument(
+        "--quantize",
+        type=str,
+        choices=["off", "1/16", "1/8"],
+        default="1/16",
+        help="Quantize recorded notes to a grid (default: 1/16)",
+    )
+    
+    # Music parameters
+    parser.add_argument(
+        "--bpm",
+        type=int,
+        help="Override BPM from prompt (or detected from reference)",
+    )
+    parser.add_argument(
+        "--key",
+        type=str,
+        help="Override key from prompt (e.g., 'Am', 'C', 'F#m')",
+    )
+    parser.add_argument(
+        "--duration-bars",
+        type=int,
+        help="Override target generation length in bars (useful for smoke tests)",
+    )
+
+    # Preset system (explicit opt-in)
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        help="Apply a named preset (see --list-presets). Example: edm_house, rnb_neosoul",
+    )
+    parser.add_argument(
+        "--style-preset",
+        type=str,
+        default=None,
+        help="Apply an additional style preset on top of --preset (e.g., chill, energetic)",
+    )
+    parser.add_argument(
+        "--production-preset",
+        type=str,
+        default=None,
+        help="Apply an additional production preset on top (e.g., polished, demo_rough)",
+    )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="List available preset names and exit",
+    )
+    
+    # Export options
+    parser.add_argument(
+        "--mpc",
+        action="store_true",
+        help="Export to MPC Software .xpj format",
+    )
+    parser.add_argument(
+        "--stems",
+        action="store_true",
+        help="Export individual stem files",
+    )
+    
+    # Audio options
+    parser.add_argument(
+        "--soundfont",
+        type=str,
+        help="Path to SoundFont (.sf2/.sf3) file for audio rendering",
+    )
+    parser.add_argument(
+        "--require-soundfont",
+        action="store_true",
+        help="Fail if FluidSynth/SoundFont render cannot be used (no procedural fallback)",
+    )
+    parser.add_argument(
+        "--require-audio",
+        action="store_true",
+        help="Fail if generation does not produce an audio artifact or render diagnostics report failure",
+    )
+    parser.add_argument(
+        "--skip-default-instruments",
+        action="store_true",
+        help="Do not auto-load ./instruments when --instruments is omitted (useful for isolated FluidSynth smoke tests)",
+    )
+    parser.add_argument(
+        "--skip-expansions",
+        action="store_true",
+        help="Do not scan ../expansions or register expansion-backed instruments for this run (useful for isolated FluidSynth smoke tests)",
+    )
+    parser.add_argument(
+        "--diagnose-audio",
+        action="store_true",
+        help="Print audio renderer diagnostics (FluidSynth + SoundFont + instrument folders) and exit",
+    )
+    parser.add_argument(
+        "--samples",
+        type=str,
+        help="Path to sample directory or MPC .xpm file to import custom sounds",
+    )
+    parser.add_argument(
+        "-i", "--instruments",
+        type=str,
+        action="append",
+        dest="instruments",
+        help="Path to instruments directory for intelligent sample selection. Can be specified multiple times to combine sources (e.g., -i path1 -i path2)",
+    )
+    
+    # Template options
+    parser.add_argument(
+        "--template",
+        type=str,
+        help="Path to MPC template file for export customization",
+    )
+    
+    # Advanced features
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Random seed for reproducible generation (enables iterative refinement)",
+    )
+    parser.add_argument(
+        "--refine",
+        type=str,
+        metavar="METADATA_PATH",
+        help="Refine previous generation using its metadata (e.g., 'make snare punchier')",
+    )
+    parser.add_argument(
+        "--no-bwf",
+        action="store_true",
+        help="Disable Broadcast Wave Format metadata (use standard WAV)",
+    )
+    parser.add_argument(
+        "--use-agents",
+        action="store_true",
+        default=None,
+        help="[EXPERIMENTAL] Use agent-based generation for Ethiopian instruments (Krar, Masenqo, Washint, Begena, Kebero)",
+    )
+    parser.add_argument(
+        "--takes",
+        type=int,
+        default=0,
+        help="Number of alternative takes to generate per track (default: 0)",
+    )
+    parser.add_argument(
+        "--comp",
+        action="store_true",
+        help="Auto-generate comp track from best sections of each take (requires --takes >= 2)",
+    )
+    parser.add_argument(
+        "--comp-bars",
+        type=int,
+        default=2,
+        help="Number of bars per comp section (default: 2)",
+    )
+    
+    # History and A/B comparison
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Show generation history from project_metadata.json in output directory",
+    )
+    parser.add_argument(
+        "--compare",
+        type=str,
+        nargs=2,
+        metavar=("VER_A", "VER_B"),
+        help="Compare two versions from history (e.g., --compare 1 2)",
+    )
+    
+    # Misc options
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--no-banner",
+        action="store_true",
+        help="Suppress banner output",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output final machine-readable JSON on stdout and route progress logs to stderr",
+    )
+    
+    args = parser.parse_args()
+
+    if args.list_presets:
+        try:
+            from multimodal_gen.preset_system import PresetManager
+            mgr = PresetManager()
+            presets = mgr.list_presets()
+            print("Available presets:")
+            for p in sorted(presets, key=lambda x: (x.category.value, x.name)):
+                print(f"  - {p.name}  ({p.category.value})  {p.description}")
+            return
+        except Exception as e:
+            parser.error(f"Failed to list presets: {e}")
+
+    if args.diagnose_audio:
+        from multimodal_gen.audio_renderer import (
+            check_fluidsynth_available,
+            get_fluidsynth_version,
+            find_soundfont,
+        )
+        from multimodal_gen.fluidsynth_runtime import resolve_fluidsynth_executable
+
+        project_root = Path(__file__).parent
+        default_instruments_dir = project_root / "instruments"
+        soundfonts_dir = project_root / "assets" / "soundfonts"
+        expansions_dir = project_root.parent / "expansions"
+        fluidsynth_executable = resolve_fluidsynth_executable()
+
+        def count_audio_files(p: Path) -> int:
+            if not p.exists() or not p.is_dir():
+                return 0
+            exts = {".wav", ".wave", ".aif", ".aiff", ".flac", ".mp3", ".ogg"}
+            try:
+                return sum(1 for f in p.rglob("*") if f.is_file() and f.suffix.lower() in exts)
+            except Exception:
+                return 0
+
+        report = {
+            "schema_version": 1,
+            "fluidsynth": {
+                "available": bool(check_fluidsynth_available(fluidsynth_executable)),
+                "executable": fluidsynth_executable,
+                "version": get_fluidsynth_version(fluidsynth_executable),
+            },
+            "soundfont": {
+                "cli_arg": args.soundfont,
+                "discovered": find_soundfont(),
+                "soundfonts_dir": str(soundfonts_dir),
+                "soundfonts_dir_exists": soundfonts_dir.exists(),
+            },
+            "instruments": {
+                "default_dir": str(default_instruments_dir),
+                "default_dir_exists": default_instruments_dir.exists(),
+                "default_audio_file_count": count_audio_files(default_instruments_dir),
+                "cli_paths": args.instruments or [],
+            },
+            "expansions": {
+                "default_dir": str(expansions_dir),
+                "default_dir_exists": expansions_dir.exists(),
+            },
+        }
+
+        print(json.dumps(report, indent=2))
+        return 0
+
+    # MIDI device listing is a standalone action
+    if args.list_midi:
+        try:
+            from multimodal_gen import list_midi_inputs
+            inputs = list_midi_inputs()
+            if not inputs:
+                print("No MIDI input devices detected.")
+            else:
+                print("Available MIDI inputs:")
+                for name in inputs:
+                    print(f"  - {name}")
+            return 0
+        except Exception as e:
+            print_error(str(e))
+            return 1
+
+    score_plan_data = None
+    if args.score_plan:
+        try:
+            score_plan_path = Path(args.score_plan)
+            score_plan_data = json.loads(score_plan_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            parser.error(f"Failed to read score plan: {e}")
+    
+    # Handle server mode
+    if args.server:
+        try:
+            from multimodal_gen.server import MusicGenOSCServer, ServerConfig
+            
+            if not args.no_banner:
+                print_banner()
+            
+            # Check for FFmpeg availability (needed for YouTube reference analysis)
+            check_ffmpeg()
+            
+            config = ServerConfig(
+                recv_port=args.port,
+                send_port=args.port + 1,
+                verbose=args.verbose,
+                default_output_dir=args.output,
+                default_soundfont=args.soundfont,
+                instrument_paths=args.instruments or [],
+            )
+            
+            server = MusicGenOSCServer(config)
+            # Use handle_signals=False when --no-signals is set (for VS Code terminals)
+            server.start(handle_signals=not args.no_signals)
+            
+        except ImportError as e:
+            print_error(f"Server mode requires python-osc: {e}")
+            print_info("Install with: pip install python-osc")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print()
+            print_info("Server stopped.")
+        return
+    
+    # Handle history display (Phase A3: A/B comparison)
+    if args.history:
+        output_dir = Path(args.output)
+        if not args.no_banner:
+            print_banner()
+        success = show_generation_history(output_dir)
+        sys.exit(0 if success else 1)
+    
+    # Handle version comparison (Phase A3: A/B comparison)
+    if args.compare:
+        output_dir = Path(args.output)
+        if not args.no_banner:
+            print_banner()
+        try:
+            ver_a, ver_b = int(args.compare[0]), int(args.compare[1])
+            success = compare_versions(output_dir, ver_a, ver_b)
+            sys.exit(0 if success else 1)
+        except ValueError:
+            print_error("Version numbers must be integers (e.g., --compare 1 2)")
+            sys.exit(1)
+    
+    # Normal generation mode - handle refine mode
+    if args.refine:
+        # Refinement mode
+        if not args.prompt:
+            parser.error("Refinement prompt is required with --refine")
+        
+        try:
+            if not args.no_banner and not args.json:
+                print_banner()
+            
+            if not args.json:
+                print_info(f"Refining generation from: {args.refine}")
+                print_info(f"Refinement prompt: \"{args.prompt}\"")
+                print()
+            
+            # Run refinement
+            with _json_progress_to_stderr(args.json):
+                results = refine_generation(
+                    metadata_path=args.refine,
+                    refinement_prompt=args.prompt,
+                    output_dir=Path(args.output) if args.output != "./output" else None,
+                    bpm=args.bpm,
+                    key=args.key,
+                    export_mpc=args.mpc,
+                    export_stems=args.stems,
+                    soundfont_path=args.soundfont,
+                    instruments_paths=args.instruments,
+                    skip_default_instruments=args.skip_default_instruments,
+                    skip_expansions=args.skip_expansions,
+                    verbose=args.verbose,
+                )
+            
+            if args.json:
+                output = {
+                    "success": True,
+                    "results": results,
+                    "metadata": results.get("project_metadata"),
+                }
+                print(json.dumps(_build_json_export_view(output, omit_private_keys=True), indent=2))
+            else:
+                print_success("✓ Refinement complete!")
+                if results.get('midi'):
+                    print_info(f"MIDI: {Path(results['midi']).name}")
+                if results.get('audio'):
+                    print_info(f"Audio: {Path(results['audio']).name}")
+            
+            return
+            
+        except Exception as e:
+            if args.json:
+                output = {
+                    "success": False,
+                    "error": str(e),
+                }
+                print(json.dumps(output, indent=2))
+            else:
+                print_error(f"Refinement failed: {e}")
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+            sys.exit(1)
+    
+    # Normal generation mode - require prompt
+    if not args.prompt and not args.score_plan:
+        parser.error("prompt is required (or use --server mode)")
+    
+    # Print banner unless suppressed
+    if not args.no_banner and not args.json:
+        print_banner()
+    
+    # Ensure output directory
+    output_dir = ensure_output_dir(Path(args.output))
+    
+    if not args.json:
+        print_info(f"Output directory: {output_dir.absolute()}")
+        if args.prompt:
+            print_info(f"Prompt: \"{args.prompt}\"")
+        if args.score_plan:
+            print_info(f"Score plan: {args.score_plan}")
+        if args.reference:
+            print_info(f"Reference: {args.reference}")
+        if args.instruments:
+            print_info(f"Instruments: {args.instruments}")
+        if args.record_part:
+            print_info(f"Record part: {args.record_part} (MIDI in: {args.midi_in or 'NOT SET'})")
+        if args.seed:
+            print_info(f"Seed: {args.seed} (reproducible generation enabled)")
+        print()
+    
+    try:
+        with _json_progress_to_stderr(args.json):
+            recorded_midi_path = None
+            record_channel = None
+
+            if args.record_part:
+                if not args.midi_in:
+                    raise ValueError("--midi-in is required when using --record-part")
+
+                from multimodal_gen import (
+                    RecordConfig,
+                    record_midi_to_file,
+                )
+
+                # Record at the intended BPM (args.bpm overrides prompt parsing)
+                # If BPM isn't provided, we let parsing decide later, but recording still needs a BPM.
+                # We'll default to 140 for trap-like usability if not specified.
+                record_bpm = float(args.bpm) if args.bpm else 140.0
+                record_channel = 9 if args.record_part == 'drums' else (2 if args.record_part == 'keys' else 3)
+
+                recorded_midi_path = str(output_dir / f"recorded_{args.record_part}.mid")
+
+                def rec_progress(msg: str):
+                    if not args.json:
+                        print_info(msg)
+
+                cfg = RecordConfig(
+                    port_name=args.midi_in,
+                    bpm=record_bpm,
+                    part=args.record_part,
+                    bars=args.record_bars,
+                    seconds=args.record_seconds,
+                    count_in_bars=args.count_in,
+                    quantize=args.quantize,
+                )
+
+                print_step("0/6", f"Recording {args.record_part} from MIDI controller...")
+                record_midi_to_file(cfg, recorded_midi_path, progress=rec_progress)
+                if not args.json:
+                    print_success(f"Recorded MIDI saved: {Path(recorded_midi_path).name}")
+
+            # Run generation pipeline
+            results = run_generation(
+                prompt=args.prompt or "",
+                output_dir=output_dir,
+                bpm_override=args.bpm,
+                key_override=args.key,
+                duration_bars=args.duration_bars,
+                reference_url=args.reference,
+                export_mpc=args.mpc,
+                export_stems=args.stems,
+                soundfont_path=args.soundfont,
+                template_path=args.template,
+                instruments_paths=args.instruments,
+                skip_default_instruments=args.skip_default_instruments,
+                skip_expansions=args.skip_expansions,
+                verbose=args.verbose,
+                seed=args.seed,
+                use_bwf=not args.no_bwf,
+                takes=args.takes,
+                comp=args.comp,
+                comp_bars=args.comp_bars,
+                require_soundfont=args.require_soundfont,
+                preset=args.preset,
+                style_preset=args.style_preset,
+                production_preset=args.production_preset,
+                use_agents=args.use_agents,
+                score_plan=score_plan_data,
+            )
+
+            require_soundfont_failed = bool(args.require_soundfont and not results.get('audio'))
+            require_audio_failed = bool(args.require_audio and _require_audio_failed(results))
+
+            # Replace generated part with recorded performance (if present)
+            if recorded_midi_path and results.get('midi'):
+                from multimodal_gen import replace_channel_in_midi
+
+                print_step("5.5/6", f"Applying recorded {args.record_part} to arrangement...")
+                replace_channel_in_midi(
+                    midi_path=results['midi'],
+                    replacement_midi_path=recorded_midi_path,
+                    channel=int(record_channel),
+                    output_path=results['midi'],
+                    replacement_track_name=f"Recorded {args.record_part}",
+                )
+
+                # Re-render audio so the WAV reflects the new MIDI
+                print_step("5.7/6", "Re-rendering audio with recorded MIDI...")
+                renderer = AudioRenderer(
+                    soundfont_path=args.soundfont,
+                    output_dir=str(output_dir),
+                    verbose=args.verbose,
+                    use_bwf=not args.no_bwf,
+                )
+                # Sprint 9.4: Forward Sprint 8 bridges to re-render renderer
+                try:
+                    _rp = results.get("_reference_profile_obj")
+                    if _rp is not None:
+                        renderer.set_reference_profile(_rp)
+                except Exception:
+                    pass
+                try:
+                    _mp = results.get("_mix_policy_obj")
+                    if _mp is not None:
+                        renderer.set_mix_policy(_mp)
+                except Exception:
+                    pass
+                try:
+                    _pv = results.get("_preset_values")
+                    if _pv:
+                        renderer.set_preset_values(_pv)
+                except Exception:
+                    pass
+                results['audio'] = renderer.render_midi_to_audio(results['midi'])
+
+            # Parse prompt again for metadata (could optimize)
+            parser_instance = PromptParser()
+            parsed = parser_instance.parse(args.prompt)
+            if args.preset:
+                parsed.preset = str(args.preset).strip().lower().replace('-', '_')
+            if args.style_preset:
+                parsed.style_preset = str(args.style_preset).strip().lower().replace('-', '_')
+            if args.production_preset:
+                parsed.production_preset = str(args.production_preset).strip().lower().replace('-', '_')
+            if args.bpm:
+                parsed.bpm = args.bpm
+            if args.key:
+                if args.key.endswith("m"):
+                    parsed.key = args.key[:-1]
+                    parsed.scale = "minor"
+                else:
+                    parsed.key = args.key
+                    parsed.scale = "major"
+
+            # Metadata is already persisted by run_generation() (used by JUCE Recent Files).
+            # Keep this as a fallback for older runs / unexpected failures.
+            metadata_path = results.get("project_metadata")
+            if not metadata_path:
+                metadata_path = save_project_metadata(
+                    output_dir,
+                    args.prompt,
+                    results,
+                    parsed,
+                    seed=results.get('seed'),
+                    synthesis_params=results.get('synthesis_params')
+                )
+        
+        if args.json:
+            # JSON output mode
+            output = {
+                "success": not (require_soundfont_failed or require_audio_failed),
+                "results": results,
+                "metadata": str(metadata_path),
+            }
+            print(json.dumps(_build_json_export_view(output, omit_private_keys=True), indent=2))
+        else:
+            # Human-readable summary
+            has_audio = bool(results.get("audio"))
+            completion_title = (
+                "Generation Complete!"
+                if has_audio
+                else "Generation Complete (MIDI only - audio unavailable)"
+            )
+            summary_color = Fore.GREEN if has_audio else Fore.YELLOW
+            summary_mark = "✓" if has_audio else "⚠"
+            try:
+                print(f"\n{summary_color}{'═' * 50}{Style.RESET_ALL}")
+                print(f"{summary_color}{summary_mark} {completion_title}{Style.RESET_ALL}")
+                print(f"{summary_color}{'═' * 50}{Style.RESET_ALL}")
+            except UnicodeEncodeError:
+                ascii_mark = "[v]" if has_audio else "[!]"
+                print(f"\n{summary_color}{'=' * 50}{Style.RESET_ALL}")
+                print(f"{summary_color}{ascii_mark} {completion_title}{Style.RESET_ALL}")
+                print(f"{summary_color}{'=' * 50}{Style.RESET_ALL}")
+            
+            if results["midi"]:
+                try:
+                    print(f"  📄 MIDI:    {Path(results['midi']).name}")
+                except UnicodeEncodeError:
+                    print(f"  [MIDI]      {Path(results['midi']).name}")
+            if results["audio"]:
+                try:
+                    print(f"  🔊 Audio:   {Path(results['audio']).name}")
+                except UnicodeEncodeError:
+                    print(f"  [Audio]     {Path(results['audio']).name}")
+            if results["mpc"]:
+                try:
+                    print(f"  🎹 MPC:     {Path(results['mpc']).parent.name}/")
+                except UnicodeEncodeError:
+                    print(f"  [MPC]       {Path(results['mpc']).parent.name}/")
+            if results["stems"]:
+                try:
+                    print(f"  🎚️  Stems:   {len(results['stems'])} files")
+                except UnicodeEncodeError:
+                    print(f"  [Stems]     {len(results['stems'])} files")
+            if results["samples"]:
+                try:
+                    print(f"  🥁 Samples: {len(results['samples'])} files")
+                except UnicodeEncodeError:
+                    print(f"  [Samples]   {len(results['samples'])} files")
+            if results.get("instruments_used"):
+                try:
+                    print(f"  🎺 Custom Instruments: {len(results['instruments_used'])} selected")
+                except UnicodeEncodeError:
+                    print(f"  [Inst]      {len(results['instruments_used'])} selected")
+            
+            try:
+                print(f"\n  📁 Output:  {output_dir.absolute()}")
+            except UnicodeEncodeError:
+                print(f"\n  [Output]    {output_dir.absolute()}")
+            if require_audio_failed:
+                print_warning("--require-audio failed: audio artifact missing or render diagnostics reported failure")
+            print()
+
+        return 2 if (require_soundfont_failed or require_audio_failed) else 0
+        
+    except KeyboardInterrupt:
+        if not args.json:
+            print_warning("\nGeneration cancelled by user")
+        return 130
+        
+    except Exception as e:
+        if args.json:
+            output = {
+                "success": False,
+                "error": str(e),
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            print_error(f"Generation failed: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

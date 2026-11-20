@@ -1,0 +1,28 @@
+{
+  "name": "multimodal-ai-music-gen",
+  "version": "1.0.0",
+  "description": "Multimodal AI Music Generator - JUCE app with Python backend",
+  "scripts": {
+    "build": "node scripts/cmake.js --build juce/build --config Release",
+    "build:debug": "node scripts/cmake.js --build juce/build --config Debug",
+    "rebuild": "node scripts/cmake.js --build juce/build --config Release --clean-first",
+    "configure": "node scripts/cmake.js -S juce -B juce/build",
+    "cmake:which": "node scripts/cmake.js --print",
+    "start": "start \"\" \"juce\\build\\MultimodalMusicGen_artefacts\\Release\\AI Music Generator.exe\"",
+    "start:server": "python -m multimodal_gen.server --verbose",
+    "start:all": "node scripts/start-all.js",
+    "stop": "node scripts/stop.js",
+    "test": "python -m pytest test_suite.py -v",
+    "test:quick": "python -m pytest test_suite.py -v -x",
+    "clean": "node scripts/cmake.js --build juce/build --target clean"
+  },
+  "keywords": [
+    "music",
+    "ai",
+    "midi",
+    "juce",
+    "osc"
+  ],
+  "author": "TayDa64",
+  "license": "MIT"
+}

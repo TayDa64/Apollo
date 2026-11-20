@@ -1,0 +1,252 @@
+{
+  "version": "1.0",
+  "active_handoff": null,
+  "handoff_history": [
+    {
+      "id": "handoff-001",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "task-001",
+      "payload": {
+        "plan": "Add Ethiopian instruments to instrument_manager.py: 1) enum values, 2) DIR_TO_CATEGORY, 3) KEYWORD_TO_CATEGORY, 4) GENRE_PROFILES"
+      },
+      "result": "completed",
+      "timestamp": "2026-01-16T00:22:00Z"
+    },
+    {
+      "id": "handoff-002",
+      "from_agent": "builder",
+      "to_agent": "verifier",
+      "task_id": "task-001",
+      "payload": {
+        "changes": "Added KRAR, MASENQO, WASHINT, BEGENA, KEBERO to enum and all related mappings",
+        "verification_scope": "Validate all 4 components present, check syntax"
+      },
+      "result": "PASS",
+      "timestamp": "2026-01-16T00:26:00Z"
+    },
+    {
+      "id": "handoff-003",
+      "from_agent": "verifier",
+      "to_agent": "supervisor",
+      "task_id": "task-001",
+      "payload": {
+        "verdict": "PASS",
+        "proofs": [
+          "InstrumentCategory enum has 5 Ethiopian instruments at lines 68-72",
+          "DIR_TO_CATEGORY has 6 mappings at lines 96-101",
+          "KEYWORD_TO_CATEGORY has 5 entries at lines 118-122",
+          "GENRE_PROFILES has ethiopian_traditional and eskista at lines 404-416",
+          "Pylance syntax check: No errors"
+        ]
+      },
+      "result": "aggregated",
+      "timestamp": "2026-01-16T00:28:00Z"
+    },
+    {
+      "id": "handoff-ui-result-contract-builder-20260825",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "ui-result-contract-diagnostics-20260825",
+      "payload": {
+        "plan": "Add additive renderer_path, pipeline_stages, and compact track_programs result diagnostics plus JUCE parsing/display and tests."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-25T13:00:00-07:00"
+    },
+    {
+      "id": "handoff-ui-result-contract-verifier-20260825",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "ui-result-contract-diagnostics-20260825",
+      "payload": {
+        "verification_scope": "Protocol tests, real render probe, JUCE Release build, launch smoke, and diagnostics."
+      },
+      "result": "PASS",
+      "timestamp": "2026-08-25T13:00:00-07:00"
+    },
+    {
+      "id": "handoff-ui-last-generation-banner-builder-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "ui-last-generation-banner-20260826",
+      "payload": {
+        "plan": "Add a persistent display-only Last Generation banner in VisualizationPanel fed from existing GenerationResult diagnostics."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-26T12:00:00-07:00"
+    },
+    {
+      "id": "handoff-ui-last-generation-banner-verifier-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "ui-last-generation-banner-20260826",
+      "payload": {
+        "verification_scope": "Diff review, diagnostics, focused tests, JUCE build, launch screenshot smoke, and cleanup."
+      },
+      "result": "PASS_WITH_CAVEAT",
+      "timestamp": "2026-08-26T12:00:00-07:00"
+    },
+    {
+      "id": "handoff-user-findings-modal-instruments-builder-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "ui-summary-close-and-orchestral-melody-fix-20260826",
+      "payload": {
+        "plan": "Shorten the Generation Summary modal and suppress generic orchestral brass Melody creation without breaking genre guardrails."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-26T12:50:00-07:00"
+    },
+    {
+      "id": "handoff-user-findings-modal-instruments-verifier-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "ui-summary-close-and-orchestral-melody-fix-20260826",
+      "payload": {
+        "verification_scope": "Focused/full MIDI tests, protocol smoke, real backend repro, cross-genre audit, JUCE build, diagnostics."
+      },
+      "result": "PASS_WITH_FOLLOWUP",
+      "timestamp": "2026-08-26T12:50:00-07:00"
+    },
+    {
+      "id": "handoff-arrange-generated-midi-parity-builder-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "arrange-generated-midi-parity-20260826",
+      "payload": {
+        "plan": "Fix ProjectState MIDI import to skip Meta lanes, preserve generated GM identity in Arrange dropdowns, and keep backend WAV loaded during import/sync."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-26T13:20:00-07:00"
+    },
+    {
+      "id": "handoff-arrange-generated-midi-parity-verifier-20260826",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "arrange-generated-midi-parity-20260826",
+      "payload": {
+        "verification_scope": "Diagnostics, diff-check, backend guardrails, JUCE build, launch/screenshot smoke."
+      },
+      "result": "PASS_WITH_MANUAL_FOLLOWUP",
+      "timestamp": "2026-08-26T13:20:00-07:00"
+    },
+    {
+      "id": "handoff-lazy-expansion-resolution-builder-20260830",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "lazy-expansion-instrument-resolution-20260830",
+      "payload": {
+        "plan": "Stop eager expansion MIDI-program allocation, prevent dynamic prefix matches, add semantic GM fallback, and protect generic GM built-in roles before expansion semantic matching."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-30T22:45:00-07:00"
+    },
+    {
+      "id": "handoff-lazy-expansion-resolution-verifier-20260830",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "lazy-expansion-instrument-resolution-20260830",
+      "payload": {
+        "verification_scope": "Focused tests, broader instrument/MIDI regressions, real auto-scan probe, real generation spam probe, py_compile, diagnostics, diff-check."
+      },
+      "result": "PASS",
+      "timestamp": "2026-08-30T22:45:00-07:00"
+    },
+    {
+      "id": "handoff-track-dropdown-catalog-builder-20260831",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "track-dropdown-full-instrument-catalog-20260831",
+      "payload": {
+        "plan": "Bridge full backend/manual MUSE/instruments catalog into Arrange track dropdowns with category headings, sample IDs, deterministic sorting, dedupe, and cleaned display names."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-31T08:45:00-07:00"
+    },
+    {
+      "id": "handoff-track-dropdown-catalog-verifier-20260831",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "track-dropdown-full-instrument-catalog-20260831",
+      "payload": {
+        "verification_scope": "Diff review, C++ diagnostics, diff-check, Release build, local catalog count probe, instrument-resolution smoke tests."
+      },
+      "result": "PASS_WITH_MANUAL_FOLLOWUP",
+      "timestamp": "2026-08-31T08:45:00-07:00"
+    },
+    {
+      "id": "handoff-searchable-track-instrument-picker-builder-20260831",
+      "from_agent": "supervisor",
+      "to_agent": "builder",
+      "task_id": "searchable-track-instrument-picker-20260831",
+      "payload": {
+        "plan": "Replace flat long track instrument ComboBox with compact selector that opens categorized browse submenus and a search dialog."
+      },
+      "result": "completed",
+      "timestamp": "2026-08-31T09:15:00-07:00"
+    },
+    {
+      "id": "handoff-searchable-track-instrument-picker-verifier-20260831",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "searchable-track-instrument-picker-20260831",
+      "payload": {
+        "verification_scope": "C++ diagnostics, diff-check, Release build; manual GUI follow-up recommended."
+      },
+      "result": "PASS_WITH_MANUAL_FOLLOWUP",
+      "timestamp": "2026-08-31T09:15:00-07:00"
+    },
+    {
+      "id": "handoff-build-startup-hardening-verifier-20260831",
+      "from_agent": "supervisor",
+      "to_agent": "verifier",
+      "task_id": "build-startup-hardening-20260831",
+      "payload": {
+        "verification_scope": "CMake wrapper, npm build, server port conflict, start-all duplicate/start/stop workflow, server log encoding, diagnostics."
+      },
+      "result": "PASS",
+      "timestamp": "2026-08-31T10:20:00-07:00"
+    }
+  ],
+  "handoff_templates": {
+    "supervisor_to_builder": {
+      "required_fields": [
+        "plan",
+        "files_to_modify",
+        "constraints"
+      ],
+      "example": {
+        "plan": "Description of what to implement",
+        "files_to_modify": [
+          "list",
+          "of",
+          "files"
+        ],
+        "constraints": "Minimal diffs, preserve existing functionality"
+      }
+    },
+    "builder_to_verifier": {
+      "required_fields": [
+        "changes",
+        "verification_scope"
+      ],
+      "example": {
+        "changes": "Summary of what was changed",
+        "verification_scope": "What to verify: syntax, completeness, tests"
+      }
+    },
+    "verifier_to_supervisor": {
+      "required_fields": [
+        "verdict",
+        "proofs"
+      ],
+      "example": {
+        "verdict": "PASS or FAIL",
+        "proofs": [
+          "List of evidence supporting verdict"
+        ]
+      }
+    }
+  }
+}

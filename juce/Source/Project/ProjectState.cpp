@@ -1,0 +1,1025 @@
+/*
+  ==============================================================================
+
+    ProjectState.cpp
+    
+    Manages the project document state using juce::ValueTree and UndoManager.
+
+  ==============================================================================
+*/
+
+#include "ProjectState.h"
+
+namespace Project
+{
+    namespace
+    {
+        juce::String gmProgramDisplayName(int program)
+        {
+            static const char* const names[] = {
+                "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", "Honky-tonk Piano",
+                "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavinet",
+                "Celesta", "Glockenspiel", "Music Box", "Vibraphone", "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
+                "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ", "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
+                "Acoustic Guitar Nylon", "Acoustic Guitar Steel", "Electric Guitar Jazz", "Electric Guitar Clean",
+                "Electric Guitar Muted", "Overdriven Guitar", "Distortion Guitar", "Guitar Harmonics",
+                "Acoustic Bass", "Electric Bass Finger", "Electric Bass Pick", "Fretless Bass", "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+                "Violin", "Viola", "Cello", "Contrabass", "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
+                "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2", "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+                "Trumpet", "Trombone", "Tuba", "Muted Trumpet", "French Horn", "Brass Section", "Synth Brass 1", "Synth Brass 2",
+                "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax", "Oboe", "English Horn", "Bassoon", "Clarinet",
+                "Piccolo", "Flute", "Recorder", "Pan Flute", "Blown Bottle", "Shakuhachi", "Whistle", "Ocarina",
+                "Lead 1 Square", "Lead 2 Sawtooth", "Lead 3 Calliope", "Lead 4 Chiff", "Lead 5 Charang", "Lead 6 Voice", "Lead 7 Fifths", "Lead 8 Bass+Lead",
+                "Pad 1 New Age", "Pad 2 Warm", "Pad 3 Polysynth", "Pad 4 Choir", "Pad 5 Bowed", "Pad 6 Metallic", "Pad 7 Halo", "Pad 8 Sweep",
+                "FX 1 Rain", "FX 2 Soundtrack", "FX 3 Crystal", "FX 4 Atmosphere", "FX 5 Brightness", "FX 6 Goblins", "FX 7 Echoes", "FX 8 Sci-fi",
+                "Sitar", "Banjo", "Shamisen", "Koto", "Kalimba", "Bagpipe", "Fiddle", "Shanai",
+                "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock", "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+                "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", "Telephone Ring", "Helicopter", "Applause", "Gunshot"
+            };
+
+            if (program >= 0 && program < (int)(sizeof(names) / sizeof(names[0])))
+                return names[program];
+            return "GM Program " + juce::String(program);
+        }
+    }
+
+    ProjectState::ProjectState()
+        : projectTree(IDs::PROJECT), isDirty(false)
+    {
+        createDefaultProject();
+        projectTree.addListener(this);
+    }
+
+    ProjectState::~ProjectState()
+    {
+        projectTree.removeListener(this);
+    }
+
+    void ProjectState::addStateListener(juce::ValueTree::Listener* listener)
+    {
+        if (listener == nullptr)
+            return;
+
+        externalStateListeners.addIfNotAlreadyThere(listener);
+        projectTree.addListener(listener);
+    }
+
+    void ProjectState::removeStateListener(juce::ValueTree::Listener* listener)
+    {
+        if (listener == nullptr)
+            return;
+
+        externalStateListeners.removeFirstMatchingValue(listener);
+        projectTree.removeListener(listener);
+    }
+
+    void ProjectState::ensureTrackDefaults(juce::ValueTree& trackNode)
+    {
+        if (!trackNode.isValid() || !trackNode.hasType(IDs::TRACK))
+            return;
+
+        if (!trackNode.hasProperty(IDs::name))
+            trackNode.setProperty(IDs::name, "Track " + juce::String((int)trackNode.getProperty(IDs::index, 0) + 1), nullptr);
+        if (!trackNode.hasProperty(IDs::volume))
+            trackNode.setProperty(IDs::volume, 1.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::pan))
+            trackNode.setProperty(IDs::pan, 0.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::stereoWidth))
+            trackNode.setProperty(IDs::stereoWidth, 1.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::mute))
+            trackNode.setProperty(IDs::mute, false, nullptr);
+        if (!trackNode.hasProperty(IDs::solo))
+            trackNode.setProperty(IDs::solo, false, nullptr);
+
+        // Default instrument
+        if (!trackNode.hasProperty(IDs::instrumentId))
+            trackNode.setProperty(IDs::instrumentId, "default_sine", nullptr);
+
+        // Default Synth parameter defaults
+        if (!trackNode.hasProperty(IDs::defaultSynthWaveform))
+            trackNode.setProperty(IDs::defaultSynthWaveform, 1, nullptr); // 1=Sine (matches UI combo ids)
+        if (!trackNode.hasProperty(IDs::defaultSynthAttack))
+            trackNode.setProperty(IDs::defaultSynthAttack, 0.001f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthDecay))
+            trackNode.setProperty(IDs::defaultSynthDecay, 0.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthSustain))
+            trackNode.setProperty(IDs::defaultSynthSustain, 1.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthRelease))
+            trackNode.setProperty(IDs::defaultSynthRelease, 0.2f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthCutoff))
+            trackNode.setProperty(IDs::defaultSynthCutoff, 16000.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthCutoffVelocityDelta))
+            trackNode.setProperty(IDs::defaultSynthCutoffVelocityDelta, 0.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthLfoRate))
+            trackNode.setProperty(IDs::defaultSynthLfoRate, 5.0f, nullptr);
+        if (!trackNode.hasProperty(IDs::defaultSynthLfoDepth))
+            trackNode.setProperty(IDs::defaultSynthLfoDepth, 0.0f, nullptr);
+    }
+
+    void ProjectState::createDefaultProject()
+    {
+        projectTree.removeAllChildren(&undoManager);
+        projectTree.removeAllProperties(&undoManager);
+        
+        projectTree.setProperty(IDs::version, "1.1.0", &undoManager);
+        
+        // Create Generation Node
+        juce::ValueTree genNode(IDs::GENERATION);
+        projectTree.addChild(genNode, -1, &undoManager);
+        
+        // Create Mixer Node
+        juce::ValueTree mixerNode(IDs::MIXER);
+        projectTree.addChild(mixerNode, -1, &undoManager);
+        
+        // Create 4 default tracks
+        for (int i = 0; i < 4; ++i)
+        {
+            juce::ValueTree trackNode(IDs::TRACK);
+            trackNode.setProperty(IDs::index, i, nullptr);
+            ensureTrackDefaults(trackNode);
+            mixerNode.addChild(trackNode, -1, &undoManager);
+        }
+        
+        // Create Instruments Node
+        juce::ValueTree instNode(IDs::INSTRUMENTS);
+        projectTree.addChild(instNode, -1, &undoManager);
+        
+        // Create Notes Node (under Generation for now, or root?)
+        // Let's put it at root for easier access, representing the "Arrangement"
+        juce::ValueTree notesNode(IDs::NOTES);
+        projectTree.addChild(notesNode, -1, &undoManager);
+        
+        // Create FX Chains Node
+        juce::ValueTree fxChainsNode(IDs::FX_CHAINS);
+        projectTree.addChild(fxChainsNode, -1, &undoManager);
+        
+        undoManager.clearUndoHistory();
+        currentFile = juce::File();
+    }
+
+    void ProjectState::newProject()
+    {
+        createDefaultProject();
+        isDirty = false;
+    }
+
+    bool ProjectState::loadProject(const juce::File& file)
+    {
+        auto xml = juce::parseXML(file);
+        if (xml != nullptr && xml->hasTagName(IDs::PROJECT))
+        {
+            auto newTree = juce::ValueTree::fromXml(*xml);
+            if (newTree.isValid())
+            {
+                // Detach external listeners from old tree, then reattach to the new tree.
+                for (auto* l : externalStateListeners)
+                    projectTree.removeListener(l);
+
+                projectTree.removeListener(this);
+                projectTree = newTree;
+                projectTree.addListener(this);
+
+                for (auto* l : externalStateListeners)
+                    projectTree.addListener(l);
+
+                // Ensure any newly-added properties exist for older projects
+                auto mixerNode = projectTree.getChildWithName(IDs::MIXER);
+                if (mixerNode.isValid())
+                {
+                    for (auto child : mixerNode)
+                        if (child.hasType(IDs::TRACK))
+                            ensureTrackDefaults(child);
+                }
+
+                // One-time migration: some older sessions stored note "channel" as 1-based track number
+                // (Track 1 => 1) instead of our 0-based track index. Detect and fix safely.
+                static const juce::Identifier legacyFixedId("legacyTrackChannelsFixed");
+                if (! (bool) projectTree.getProperty(legacyFixedId, false))
+                {
+                    auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+                    auto mixerNode = projectTree.getChildWithName(IDs::MIXER);
+
+                    int trackCount = 0;
+                    if (mixerNode.isValid())
+                    {
+                        for (const auto& child : mixerNode)
+                        {
+                            if (child.hasType(IDs::TRACK))
+                            {
+                                int idx = (int)child.getProperty(IDs::index);
+                                trackCount = juce::jmax(trackCount, idx + 1);
+                            }
+                        }
+                    }
+
+                    if (notesNode.isValid() && notesNode.getNumChildren() > 0 && trackCount > 0)
+                    {
+                        bool hasZero = false;
+                        int minCh = 999;
+                        int maxCh = -999;
+
+                        for (const auto& note : notesNode)
+                        {
+                            if (!note.hasType(IDs::NOTE))
+                                continue;
+                            int ch = (int)note.getProperty(IDs::channel);
+                            if (ch == 0) hasZero = true;
+                            minCh = juce::jmin(minCh, ch);
+                            maxCh = juce::jmax(maxCh, ch);
+                        }
+
+                        // Heuristic: if there are notes, none are on channel 0, and all channels are within 1..trackCount,
+                        // treat it as legacy 1-based and shift down.
+                        if (!hasZero && minCh >= 1 && maxCh <= trackCount)
+                        {
+                            for (int i = 0; i < notesNode.getNumChildren(); ++i)
+                            {
+                                auto note = notesNode.getChild(i);
+                                if (!note.hasType(IDs::NOTE))
+                                    continue;
+                                int ch = (int)note.getProperty(IDs::channel);
+                                note.setProperty(IDs::channel, juce::jmax(0, ch - 1), nullptr);
+                            }
+                            projectTree.setProperty(legacyFixedId, true, nullptr);
+                        }
+                    }
+                }
+
+                undoManager.clearUndoHistory();
+                currentFile = file;
+                isDirty = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ProjectState::saveProject(const juce::File& file)
+    {
+        if (auto xml = projectTree.createXml())
+        {
+            if (xml->writeTo(file))
+            {
+                currentFile = file;
+                isDirty = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int ProjectState::collectAndCopy(const juce::File& projectFile)
+    {
+        auto projectDir = projectFile.getParentDirectory();
+        auto baseName = projectFile.getFileNameWithoutExtension();
+        auto filesDir = projectDir.getChildFile(baseName + "_files");
+        
+        // Create subfolder structure
+        auto midiDir = filesDir.getChildFile("midi");
+        auto audioDir = filesDir.getChildFile("audio");
+        auto instrumentsDir = filesDir.getChildFile("instruments");
+        auto soundfontsDir = filesDir.getChildFile("soundfonts");
+        
+        midiDir.createDirectory();
+        audioDir.createDirectory();
+        instrumentsDir.createDirectory();
+        soundfontsDir.createDirectory();
+        
+        int filesCopied = 0;
+        
+        // Helper: copy a file to a destination directory and return the relative path
+        auto copyAndRelativize = [&](const juce::String& absPath, const juce::File& destDir) -> juce::String
+        {
+            if (absPath.isEmpty()) return absPath;
+            
+            juce::File srcFile(absPath);
+            if (!srcFile.existsAsFile()) return absPath; // Leave unchanged if missing
+            
+            auto destFile = destDir.getChildFile(srcFile.getFileName());
+            
+            // Skip if already collected (same file)
+            if (destFile.existsAsFile() && destFile.getSize() == srcFile.getSize())
+            {
+                ++filesCopied;
+                return destFile.getRelativePathFrom(projectDir);
+            }
+            
+            if (srcFile.copyFileTo(destFile))
+            {
+                ++filesCopied;
+                return destFile.getRelativePathFrom(projectDir);
+            }
+            
+            return absPath; // Copy failed — leave original
+        };
+        
+        // Collect GENERATION midiPath and audioPath
+        auto genNode = projectTree.getChildWithName(IDs::GENERATION);
+        if (genNode.isValid())
+        {
+            juce::String mp = genNode.getProperty(IDs::midiPath).toString();
+            if (mp.isNotEmpty())
+            {
+                // Resolve if relative
+                juce::File midiFile = juce::File::isAbsolutePath(mp) ? juce::File(mp) : projectDir.getChildFile(mp);
+                if (midiFile.existsAsFile())
+                    genNode.setProperty(IDs::midiPath, copyAndRelativize(midiFile.getFullPathName(), midiDir), nullptr);
+            }
+            
+            juce::String ap = genNode.getProperty(IDs::audioPath).toString();
+            if (ap.isNotEmpty())
+            {
+                juce::File audioFile = juce::File::isAbsolutePath(ap) ? juce::File(ap) : projectDir.getChildFile(ap);
+                if (audioFile.existsAsFile())
+                    genNode.setProperty(IDs::audioPath, copyAndRelativize(audioFile.getFullPathName(), audioDir), nullptr);
+            }
+        }
+        
+        // Collect TRACK instrument paths
+        auto mixerNode = projectTree.getChildWithName(IDs::MIXER);
+        if (mixerNode.isValid())
+        {
+            for (auto child : mixerNode)
+            {
+                if (!child.hasType(IDs::TRACK)) continue;
+                
+                juce::String pathStr = child.getProperty(IDs::path).toString();
+                if (pathStr.isNotEmpty())
+                {
+                    juce::File srcFile = juce::File::isAbsolutePath(pathStr) ? juce::File(pathStr) : projectDir.getChildFile(pathStr);
+                    
+                    // Route to appropriate subfolder based on extension
+                    auto ext = srcFile.getFileExtension().toLowerCase();
+                    juce::File destDir = instrumentsDir;
+                    if (ext == ".sf2" || ext == ".sfz")
+                        destDir = soundfontsDir;
+                    
+                    child.setProperty(IDs::path, copyAndRelativize(srcFile.getFullPathName(), destDir), nullptr);
+                }
+            }
+        }
+        
+        // Collect INSTRUMENT paths
+        auto instsNode = projectTree.getChildWithName(IDs::INSTRUMENTS);
+        if (instsNode.isValid())
+        {
+            for (auto child : instsNode)
+            {
+                if (!child.hasType(IDs::INSTRUMENT)) continue;
+                
+                juce::String pathStr = child.getProperty(IDs::path).toString();
+                if (pathStr.isNotEmpty())
+                {
+                    juce::File srcFile = juce::File::isAbsolutePath(pathStr) ? juce::File(pathStr) : projectDir.getChildFile(pathStr);
+                    
+                    auto ext = srcFile.getFileExtension().toLowerCase();
+                    juce::File destDir = instrumentsDir;
+                    if (ext == ".sf2" || ext == ".sfz")
+                        destDir = soundfontsDir;
+                    
+                    child.setProperty(IDs::path, copyAndRelativize(srcFile.getFullPathName(), destDir), nullptr);
+                }
+            }
+        }
+        
+        DBG("ProjectState::collectAndCopy - Collected " << filesCopied << " files into " << filesDir.getFullPathName());
+        return filesCopied;
+    }
+
+    //==============================================================================
+    // Accessors & Modifiers
+
+    void ProjectState::setGenerationData(const juce::String& prompt, int bpm, const juce::String& key, const juce::String& genre)
+    {
+        auto genNode = projectTree.getChildWithName(IDs::GENERATION);
+        if (genNode.isValid())
+        {
+            undoManager.beginNewTransaction("Update Generation Data");
+            genNode.setProperty(IDs::prompt, prompt, &undoManager);
+            genNode.setProperty(IDs::bpm, bpm, &undoManager);
+            genNode.setProperty(IDs::key, key, &undoManager);
+            genNode.setProperty(IDs::genre, genre, &undoManager);
+        }
+    }
+
+    void ProjectState::setGeneratedFiles(const juce::String& midiPath, const juce::String& audioPath)
+    {
+        auto genNode = projectTree.getChildWithName(IDs::GENERATION);
+        if (genNode.isValid())
+        {
+            undoManager.beginNewTransaction("Update Generated Files");
+            genNode.setProperty(IDs::midiPath, midiPath, &undoManager);
+            genNode.setProperty(IDs::audioPath, audioPath, &undoManager);
+        }
+    }
+
+    juce::ValueTree ProjectState::getMixerNode()
+    {
+        return projectTree.getChildWithName(IDs::MIXER);
+    }
+
+    juce::ValueTree ProjectState::getTrackNode(int index)
+    {
+        auto mixerNode = getMixerNode();
+        if (!mixerNode.isValid()) return {};
+
+        // Find track with index
+        for (auto child : mixerNode)
+        {
+            if (child.hasType(IDs::TRACK) && (int)child.getProperty(IDs::index) == index)
+                return child;
+        }
+
+        // Create if not exists
+        juce::ValueTree trackNode(IDs::TRACK);
+        trackNode.setProperty(IDs::index, index, nullptr);
+        ensureTrackDefaults(trackNode);
+        mixerNode.addChild(trackNode, -1, &undoManager);
+        return trackNode;
+    }
+    
+    juce::ValueTree ProjectState::getInstrumentsNode()
+    {
+        auto node = projectTree.getChildWithName(IDs::INSTRUMENTS);
+        if (!node.isValid())
+        {
+            node = juce::ValueTree(IDs::INSTRUMENTS);
+            projectTree.addChild(node, -1, &undoManager);
+        }
+        return node;
+    }
+    
+    juce::ValueTree ProjectState::getFXChainsNode()
+    {
+        auto node = projectTree.getChildWithName(IDs::FX_CHAINS);
+        if (!node.isValid())
+        {
+            node = juce::ValueTree(IDs::FX_CHAINS);
+            projectTree.addChild(node, -1, &undoManager);
+        }
+        return node;
+    }
+
+    void ProjectState::setTrackVolume(int trackIndex, float volume)
+    {
+        auto track = getTrackNode(trackIndex);
+        if (track.isValid())
+        {
+            // Don't start a new transaction for continuous updates like sliders, 
+            // usually handled by the UI calling beginNewTransaction on mouse down.
+            // For now, we'll just set it.
+            track.setProperty(IDs::volume, volume, &undoManager);
+        }
+    }
+
+    void ProjectState::setTrackPan(int trackIndex, float pan)
+    {
+        auto track = getTrackNode(trackIndex);
+        if (track.isValid())
+            track.setProperty(IDs::pan, pan, &undoManager);
+    }
+
+    void ProjectState::setTrackMute(int trackIndex, bool mute)
+    {
+        auto track = getTrackNode(trackIndex);
+        if (track.isValid())
+        {
+            undoManager.beginNewTransaction("Toggle Mute");
+            track.setProperty(IDs::mute, mute, &undoManager);
+        }
+    }
+
+    void ProjectState::setTrackSolo(int trackIndex, bool solo)
+    {
+        auto track = getTrackNode(trackIndex);
+        if (track.isValid())
+        {
+            undoManager.beginNewTransaction("Toggle Solo");
+            track.setProperty(IDs::solo, solo, &undoManager);
+        }
+    }
+
+    void ProjectState::setTrackStereoWidth(int trackIndex, float width)
+    {
+        auto mixer = getMixerNode();
+        auto track = mixer.getChildWithProperty(IDs::index, trackIndex);
+        if (track.isValid())
+        {
+            track.setProperty(IDs::stereoWidth, juce::jlimit(0.0f, 2.0f, width), &undoManager);
+        }
+    }
+    
+    void ProjectState::setInstrument(int trackIndex, const juce::String& name, const juce::String& path)
+    {
+        auto instsNode = projectTree.getChildWithName(IDs::INSTRUMENTS);
+        if (!instsNode.isValid()) return;
+        
+        // Find or create instrument node for this track
+        juce::ValueTree instNode;
+        for (auto child : instsNode)
+        {
+            if (child.hasType(IDs::INSTRUMENT) && (int)child.getProperty(IDs::index) == trackIndex)
+            {
+                instNode = child;
+                break;
+            }
+        }
+        
+        if (!instNode.isValid())
+        {
+            instNode = juce::ValueTree(IDs::INSTRUMENT);
+            instNode.setProperty(IDs::index, trackIndex, nullptr);
+            instsNode.addChild(instNode, -1, &undoManager);
+        }
+        
+        undoManager.beginNewTransaction("Change Instrument");
+        instNode.setProperty(IDs::name, name, &undoManager);
+        instNode.setProperty(IDs::path, path, &undoManager);
+    }
+
+    //==============================================================================
+    // Note Editing
+    void ProjectState::clearNotes()
+    {
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (notesNode.isValid())
+        {
+            undoManager.beginNewTransaction("Clear Notes");
+            notesNode.removeAllChildren(&undoManager);
+        }
+    }
+
+    void ProjectState::addNote(int noteNum, double startBeats, double lengthBeats, int velocity, int channel)
+    {
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (notesNode.isValid())
+        {
+            juce::ValueTree note(IDs::NOTE);
+            note.setProperty(IDs::noteNumber, noteNum, nullptr);
+            note.setProperty(IDs::start, startBeats, nullptr);
+            note.setProperty(IDs::length, lengthBeats, nullptr);
+            note.setProperty(IDs::velocity, velocity, nullptr);
+            note.setProperty(IDs::channel, channel, nullptr);
+            
+            // Don't start a transaction here, usually called in batch or by UI that started one
+            notesNode.addChild(note, -1, &undoManager);
+        }
+        else
+        {
+            DBG("ERROR: addNote called but NOTES node is invalid!");
+        }
+    }
+
+    void ProjectState::deleteNote(const juce::ValueTree& noteNode)
+    {
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (notesNode.isValid() && noteNode.isAChildOf(notesNode))
+        {
+            notesNode.removeChild(noteNode, &undoManager);
+        }
+    }
+
+    void ProjectState::deleteNotes(const juce::Array<juce::ValueTree>& noteNodes)
+    {
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (!notesNode.isValid()) return;
+        
+        // Delete in reverse order to avoid index shifting issues
+        for (int i = noteNodes.size() - 1; i >= 0; --i)
+        {
+            const auto& noteNode = noteNodes[i];
+            if (noteNode.isValid() && noteNode.isAChildOf(notesNode))
+            {
+                notesNode.removeChild(noteNode, &undoManager);
+            }
+        }
+    }
+
+    void ProjectState::moveNote(juce::ValueTree& noteNode, double newStart, int newNoteNum)
+    {
+        if (noteNode.isValid())
+        {
+            noteNode.setProperty(IDs::start, newStart, &undoManager);
+            noteNode.setProperty(IDs::noteNumber, newNoteNum, &undoManager);
+        }
+    }
+
+    void ProjectState::resizeNote(juce::ValueTree& noteNode, double newLength)
+    {
+        if (noteNode.isValid())
+        {
+            noteNode.setProperty(IDs::length, newLength, &undoManager);
+        }
+    }
+
+    void ProjectState::setNoteVelocity(juce::ValueTree& noteNode, int newVelocity)
+    {
+        if (noteNode.isValid())
+        {
+            noteNode.setProperty(IDs::velocity, newVelocity, &undoManager);
+        }
+    }
+
+    juce::ValueTree ProjectState::copyNotesForTrack(int trackIndex) const
+    {
+        juce::ValueTree snapshot("NOTES_SNAPSHOT");
+
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (!notesNode.isValid())
+            return snapshot;
+
+        for (const auto& note : notesNode)
+        {
+            if (note.hasType(IDs::NOTE) && (int)note.getProperty(IDs::channel) == trackIndex)
+                snapshot.addChild(note.createCopy(), -1, nullptr);
+        }
+
+        return snapshot;
+    }
+
+    void ProjectState::restoreNotesForTrack(int trackIndex, const juce::ValueTree& snapshot)
+    {
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (!notesNode.isValid())
+            return;
+
+        undoManager.beginNewTransaction("Revert Take Comp");
+
+        for (int i = notesNode.getNumChildren() - 1; i >= 0; --i)
+        {
+            auto child = notesNode.getChild(i);
+            if (child.hasType(IDs::NOTE) && (int)child.getProperty(IDs::channel) == trackIndex)
+                notesNode.removeChild(i, &undoManager);
+        }
+
+        for (int i = 0; i < snapshot.getNumChildren(); ++i)
+        {
+            auto child = snapshot.getChild(i);
+            if (child.hasType(IDs::NOTE))
+                notesNode.addChild(child.createCopy(), -1, &undoManager);
+        }
+    }
+
+    bool ProjectState::replaceNotesForTrackFromMidiFile(int trackIndex, const juce::File& midiFile)
+    {
+        juce::MidiFile midi;
+        juce::FileInputStream stream(midiFile);
+
+        if (!(stream.openedOk() && midi.readFrom(stream)))
+        {
+            lastImportStats = "FAILED to read take MIDI";
+            return false;
+        }
+
+        int timeFormat = midi.getTimeFormat();
+        double ticksPerBeat = (timeFormat > 0) ? (double)timeFormat : 960.0;
+
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (!notesNode.isValid())
+        {
+            lastImportStats = "FAILED: NOTES node missing";
+            return false;
+        }
+
+        undoManager.beginNewTransaction("Apply Take Comp");
+
+        // Clear existing notes for this track/channel only.
+        for (int i = notesNode.getNumChildren() - 1; i >= 0; --i)
+        {
+            auto child = notesNode.getChild(i);
+            if (child.hasType(IDs::NOTE) && (int)child.getProperty(IDs::channel) == trackIndex)
+                notesNode.removeChild(i, &undoManager);
+        }
+
+        int totalNotesAdded = 0;
+
+        for (int t = 0; t < midi.getNumTracks(); ++t)
+        {
+            const auto* track = midi.getTrack(t);
+            juce::MidiMessageSequence seq;
+            seq.addSequence(*track, 0.0, 0.0, 1e10);
+            seq.updateMatchedPairs();
+
+            for (int i = 0; i < seq.getNumEvents(); ++i)
+            {
+                auto* ev = seq.getEventPointer(i);
+                if (ev->message.isNoteOn())
+                {
+                    double start = ev->message.getTimeStamp() / ticksPerBeat;
+                    double length = 0.25;
+                    if (auto* noteOff = ev->noteOffObject)
+                        length = (noteOff->message.getTimeStamp() - ev->message.getTimeStamp()) / ticksPerBeat;
+
+                    addNote(
+                        ev->message.getNoteNumber(),
+                        start,
+                        juce::jmax(0.0, length),
+                        ev->message.getVelocity(),
+                        trackIndex
+                    );
+                    totalNotesAdded++;
+                }
+            }
+        }
+
+        lastImportStats = "Applied take comp: " + juce::String(totalNotesAdded) + " notes to track " + juce::String(trackIndex);
+        return true;
+    }
+
+    void ProjectState::importMidiFile(const juce::File& midiFile)
+    {
+        juce::MidiFile midi;
+        juce::FileInputStream stream(midiFile);
+        
+        if (stream.openedOk() && midi.readFrom(stream))
+        {
+            int timeFormat = midi.getTimeFormat();
+            double ticksPerBeat = (timeFormat > 0) ? (double)timeFormat : 960.0;
+
+            undoManager.beginNewTransaction("Import MIDI");
+            clearNotes();
+            
+            // Clear existing tracks from MIXER node before adding new ones
+            auto mixerNode = getMixerNode();
+            if (mixerNode.isValid())
+            {
+                // Remove all TRACK children
+                for (int i = mixerNode.getNumChildren() - 1; i >= 0; --i)
+                {
+                    auto child = mixerNode.getChild(i);
+                    if (child.hasType(IDs::TRACK))
+                        mixerNode.removeChild(i, &undoManager);
+                }
+            }
+            
+            auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+            int totalNotesAdded = 0;
+            
+            // Use MidiMessageSequence to pair notes.  Import only note-bearing
+            // musical tracks into Arrange: backend MIDI meta/tempo tracks are
+            // still kept in the playback MIDI file, but they are not editable
+            // lanes and should not consume UI real estate.
+            int displayTrackIndex = 0;
+            for (int t = 0; t < midi.getNumTracks(); ++t)
+            {
+                const auto* track = midi.getTrack(t);
+                juce::MidiMessageSequence seq;
+                // IMPORTANT: Use a large end time to include ALL events, not just time 0!
+                seq.addSequence(*track, 0.0, 0.0, 1e10);
+                seq.updateMatchedPairs();
+                
+                // Extract track name
+                juce::String trackName = "Track " + juce::String(t + 1);
+                for (int i = 0; i < track->getNumEvents(); ++i)
+                {
+                    const auto& msg = track->getEventPointer(i)->message;
+                    if (msg.isTrackNameEvent())
+                    {
+                        trackName = msg.getTextFromTextMetaEvent();
+                        if (trackName.isNotEmpty()) break;
+                    }
+                }
+
+                int firstProgram = -1;
+                int trackNoteCount = 0;
+                for (int i = 0; i < seq.getNumEvents(); ++i)
+                {
+                    auto* ev = seq.getEventPointer(i);
+                    if (firstProgram < 0 && ev->message.isProgramChange())
+                        firstProgram = ev->message.getProgramChangeNumber();
+                    if (ev->message.isNoteOn())
+                        ++trackNoteCount;
+                }
+
+                if (trackNoteCount <= 0)
+                    continue;
+
+                // Store note-bearing track names/program identity in the MIXER node for persistence.
+                auto mixerNode = getMixerNode();
+                if (mixerNode.isValid())
+                {
+                    // Find or create track node
+                    juce::ValueTree trackNode;
+                    for (auto child : mixerNode)
+                    {
+                        if (child.hasType(IDs::TRACK) && (int)child.getProperty(IDs::index) == displayTrackIndex)
+                        {
+                            trackNode = child;
+                            break;
+                        }
+                    }
+                    
+                    if (!trackNode.isValid())
+                    {
+                        trackNode = juce::ValueTree(IDs::TRACK);
+                        trackNode.setProperty(IDs::index, displayTrackIndex, nullptr);
+                        mixerNode.addChild(trackNode, -1, &undoManager);
+                    }
+
+                    ensureTrackDefaults(trackNode);
+                    trackNode.setProperty(IDs::name, trackName, &undoManager);
+                    trackNode.setProperty(IDs::midiSourceTrackIndex, t, &undoManager);
+                    if (firstProgram >= 0)
+                    {
+                        trackNode.setProperty(IDs::midiProgram, firstProgram, &undoManager);
+                        trackNode.setProperty(IDs::midiInstrumentName, gmProgramDisplayName(firstProgram), &undoManager);
+                        trackNode.setProperty(IDs::instrumentId, "gm_program:" + juce::String(firstProgram), &undoManager);
+                    }
+                }
+
+                for (int i = 0; i < seq.getNumEvents(); ++i)
+                {
+                    auto* ev = seq.getEventPointer(i);
+                    if (ev->message.isNoteOn())
+                    {
+                        double start = ev->message.getTimeStamp() / ticksPerBeat;
+                        double length = 0.25; // Default
+                        
+                        if (auto* noteOff = ev->noteOffObject)
+                            length = (noteOff->message.getTimeStamp() - ev->message.getTimeStamp()) / ticksPerBeat;
+                            
+                        addNote(ev->message.getNoteNumber(), 
+                                start, 
+                                length, 
+                                ev->message.getVelocity(), 
+                                displayTrackIndex); // Compact editable track index
+                        totalNotesAdded++;
+                    }
+                }
+
+                ++displayTrackIndex;
+            }
+            
+            // Store stats for debug display
+            lastImportStats = "Imported " + juce::String(totalNotesAdded) + " notes from " + 
+                             juce::String(displayTrackIndex) + " musical tracks";
+        }
+        else
+        {
+            lastImportStats = "FAILED to read MIDI";
+        }
+    }
+
+    juce::MidiFile ProjectState::exportToMidiFile()
+    {
+        juce::MidiFile midi;
+        midi.setTicksPerQuarterNote(960);
+        
+        juce::MidiMessageSequence seq;
+        
+        auto notesNode = projectTree.getChildWithName(IDs::NOTES);
+        if (notesNode.isValid())
+        {
+            for (const auto& note : notesNode)
+            {
+                if (note.hasType(IDs::NOTE))
+                {
+                    int noteNum = note.getProperty(IDs::noteNumber);
+                    double start = note.getProperty(IDs::start);
+                    double length = note.getProperty(IDs::length);
+                    int vel = note.getProperty(IDs::velocity);
+                    // IDs::channel is a 0-based track index in our model.
+                    // JUCE MIDI channels are 1..16, and MidiPlayer maps (channel - 1) back to track index.
+                    int trackIndex = (int) note.getProperty(IDs::channel);
+                    int ch = juce::jlimit(1, 16, trackIndex + 1);
+                    
+                    // Convert beats to ticks
+                    // juce::MidiFile expects ticks if we don't use setTicksPerQuarterNote?
+                    // Actually, if we use addEvent with timestamp, we need to know the unit.
+                    // If we setTicksPerQuarterNote(960), then timestamp 960 = 1 beat.
+                    
+                    int startTicks = (int)(start * 960.0);
+                    int endTicks = (int)((start + length) * 960.0);
+                    
+                    seq.addEvent(juce::MidiMessage::noteOn(ch, noteNum, (juce::uint8)vel), startTicks);
+                    seq.addEvent(juce::MidiMessage::noteOff(ch, noteNum), endTicks);
+                }
+            }
+        }
+        
+        seq.sort();
+        midi.addTrack(seq);
+        
+        return midi;
+    }
+
+    //==============================================================================
+    // FX Chain Management
+    void ProjectState::setFXChainForBus(const juce::String& busName, const juce::String& chainJSON)
+    {
+        auto fxChainsNode = getFXChainsNode();
+        if (!fxChainsNode.isValid()) return;
+        
+        // Find or create bus node
+        juce::ValueTree busNode;
+        for (auto child : fxChainsNode)
+        {
+            if (child.hasType(IDs::FX_BUS) && child.getProperty(IDs::bus).toString() == busName)
+            {
+                busNode = child;
+                break;
+            }
+        }
+        
+        if (!busNode.isValid())
+        {
+            busNode = juce::ValueTree(IDs::FX_BUS);
+            busNode.setProperty(IDs::bus, busName, nullptr);
+            fxChainsNode.addChild(busNode, -1, &undoManager);
+        }
+        
+        undoManager.beginNewTransaction("Update FX Chain");
+        
+        // Clear existing FX units
+        busNode.removeAllChildren(&undoManager);
+        
+        // Parse JSON and add FX units
+        auto parsed = juce::JSON::parse(chainJSON);
+        if (auto* chainArray = parsed.getArray())
+        {
+            for (const auto& fxVar : *chainArray)
+            {
+                juce::ValueTree fxNode(IDs::FX_UNIT);
+                fxNode.setProperty(IDs::id, fxVar.getProperty("id", juce::Uuid().toString()), nullptr);
+                fxNode.setProperty(IDs::type, fxVar.getProperty("type", ""), nullptr);
+                fxNode.setProperty(IDs::displayName, fxVar.getProperty("display_name", ""), nullptr);
+                fxNode.setProperty(IDs::enabled, (bool)fxVar.getProperty("enabled", true), nullptr);
+                
+                // Store parameters as JSON string
+                if (auto* paramsObj = fxVar.getProperty("parameters", juce::var()).getDynamicObject())
+                {
+                    fxNode.setProperty(IDs::parameters, juce::JSON::toString(juce::var(paramsObj)), nullptr);
+                }
+                
+                busNode.addChild(fxNode, -1, &undoManager);
+            }
+        }
+    }
+    
+    juce::String ProjectState::getFXChainForBus(const juce::String& busName) const
+    {
+        auto fxChainsNode = projectTree.getChildWithName(IDs::FX_CHAINS);
+        if (!fxChainsNode.isValid()) return "[]";
+        
+        // Find bus node
+        for (const auto& child : fxChainsNode)
+        {
+            if (child.hasType(IDs::FX_BUS) && child.getProperty(IDs::bus).toString() == busName)
+            {
+                juce::Array<juce::var> chainArray;
+                
+                for (const auto& fxNode : child)
+                {
+                    if (fxNode.hasType(IDs::FX_UNIT))
+                    {
+                        auto* fxObj = new juce::DynamicObject();
+                        fxObj->setProperty("id", fxNode.getProperty(IDs::id));
+                        fxObj->setProperty("type", fxNode.getProperty(IDs::type));
+                        fxObj->setProperty("display_name", fxNode.getProperty(IDs::displayName));
+                        fxObj->setProperty("enabled", fxNode.getProperty(IDs::enabled));
+                        
+                        // Parse parameters back from JSON string
+                        juce::String paramsStr = fxNode.getProperty(IDs::parameters).toString();
+                        if (paramsStr.isNotEmpty())
+                        {
+                            fxObj->setProperty("parameters", juce::JSON::parse(paramsStr));
+                        }
+                        
+                        chainArray.add(juce::var(fxObj));
+                    }
+                }
+                
+                return juce::JSON::toString(juce::var(chainArray));
+            }
+        }
+        
+        return "[]";
+    }
+    
+    juce::String ProjectState::getAllFXChainsJSON() const
+    {
+        auto* root = new juce::DynamicObject();
+        
+        root->setProperty("master", juce::JSON::parse(getFXChainForBus("master")));
+        root->setProperty("drums", juce::JSON::parse(getFXChainForBus("drums")));
+        root->setProperty("bass", juce::JSON::parse(getFXChainForBus("bass")));
+        root->setProperty("melodic", juce::JSON::parse(getFXChainForBus("melodic")));
+        
+        return juce::JSON::toString(juce::var(root));
+    }
+
+    //==============================================================================
+    // ValueTree::Listener overrides
+    void ProjectState::valueTreePropertyChanged(juce::ValueTree& treeWhosePropertyHasChanged, const juce::Identifier& property)
+    {
+        // Broadcast changes if needed, or rely on ValueTree listeners elsewhere
+        isDirty = true;
+        // Broadcast changes if needed, or rely on ValueTree listeners elsewhere
+        DBG("Property changed: " << property.toString());
+    }
+
+    void ProjectState::valueTreeChildAdded(juce::ValueTree& parentTree, juce::ValueTree& childWhichHasBeenAdded) { isDirty = true; }
+    void ProjectState::valueTreeChildRemoved(juce::ValueTree& parentTree, juce::ValueTree& childWhichHasBeenRemoved, int indexFromWhichChildWasRemoved) { isDirty = true; }
+    void ProjectState::valueTreeChildOrderChanged(juce::ValueTree& parentTreeWhichHasChanged, int oldIndex, int newIndex) { isDirty = true; }
+    void ProjectState::valueTreeParentChanged(juce::ValueTree& treeWhoseParentHasChanged) { isDirty = true; }
+}

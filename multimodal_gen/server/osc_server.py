@@ -1,0 +1,2099 @@
+"""
+OSC Server Module
+
+Main OSC server implementation for JUCE ↔ Python communication.
+Handles incoming OSC messages and dispatches responses.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import signal
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import dataclasses
+from enum import Enum
+
+try:
+    from pythonosc import dispatcher, osc_server, udp_client
+    from pythonosc.osc_message_builder import OscMessageBuilder
+    OSC_AVAILABLE = True
+except ImportError:
+    OSC_AVAILABLE = False
+
+from .config import (
+    ServerConfig,
+    OSCAddresses,
+    GenerationStep,
+    ErrorCode,
+    DEFAULT_CONFIG,
+    SCHEMA_VERSION,
+)
+from .worker import (
+    GenerationWorker,
+    GenerationRequest,
+    GenerationResult,
+    InstrumentScanWorker,
+)
+
+# Try to import expansion manager
+try:
+    from ..expansion_manager import ExpansionManager, create_expansion_manager
+    EXPANSION_AVAILABLE = True
+except ImportError:
+    ExpansionManager = None
+    create_expansion_manager = None
+    EXPANSION_AVAILABLE = False
+
+
+_TAKE_TRACK_RE = re.compile(r"^(?P<original>.+)_Take_(?P<take>\d+)$")
+_COMP_TRACK_RE = re.compile(r"^(?P<original>.+)_Comp$")
+_TAKE_ID_RE = re.compile(r"^take_(?P<take>\d+)$", re.IGNORECASE)
+
+
+class MusicGenOSCServer:
+    """
+    OSC Server for the Multimodal AI Music Generator.
+    
+    Handles bidirectional communication with JUCE client:
+    - Receives generation requests
+    - Sends progress updates
+    - Sends completion/error notifications
+    
+    Example:
+        ```python
+        server = MusicGenOSCServer(config=ServerConfig(verbose=True))
+        server.start()  # Blocking - runs until shutdown
+        ```
+    
+    Or with custom callbacks:
+        ```python
+        server = MusicGenOSCServer()
+        server.on_generation_start = lambda req: print(f"Starting: {req.prompt}")
+        server.start_async()  # Non-blocking
+        
+        # Later
+        server.stop()
+        ```
+    """
+    
+    def __init__(self, config: Optional[ServerConfig] = None, worker: Optional[GenerationWorker] = None):
+        """
+        Initialize the OSC server.
+        
+        Args:
+            config: Server configuration (uses DEFAULT_CONFIG if None)
+        """
+        if not OSC_AVAILABLE:
+            raise ImportError(
+                "python-osc is required for server mode. "
+                "Install with: pip install python-osc"
+            )
+        
+        self.config = config or DEFAULT_CONFIG
+        
+        # OSC components
+        self._dispatcher = dispatcher.Dispatcher()
+        self._server: Optional[osc_server.ThreadingOSCUDPServer] = None
+        self._client: Optional[udp_client.SimpleUDPClient] = None
+        
+        # Workers
+        self._gen_worker: Optional[GenerationWorker] = worker
+        self._instrument_worker: Optional[InstrumentScanWorker] = None
+        
+        # Expansion Manager
+        # ExpansionManager is an optional dependency in some environments; keep annotation permissive
+        self._expansion_manager: Optional[Any] = None
+        if EXPANSION_AVAILABLE:
+            # Use factory function to auto-discover expansions in standard locations
+            # This finds ../expansions automatically
+            self._expansion_manager = create_expansion_manager(auto_scan=True)
+        
+        # State
+        self._running = False
+        self._server_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._current_request_id: Optional[str] = None  # Track current request for correlation
+        self._current_fx_chain: Dict[str, Any] = {}     # FX chain configuration for render parity
+        # Phase 5.2: persisted control overrides (merged into /generate + /regenerate)
+        self._control_overrides: Dict[str, Any] = {}
+        self._selected_takes: Dict[str, str] = {}
+        self._comp_regions: Dict[str, Any] = {}
+        self._pending_generation_request: Optional[GenerationRequest] = None
+        self._last_render_context: Optional[Dict[str, Any]] = None
+        
+        # Callbacks for external integration (optional)
+        self.on_generation_start: Optional[callable] = None
+        self.on_generation_complete: Optional[callable] = None
+        self.on_error: Optional[callable] = None
+        
+        # Setup message handlers
+        self._setup_handlers()
+    
+    def _setup_handlers(self):
+        """Register OSC message handlers with dispatcher."""
+        self._dispatcher.map(OSCAddresses.GENERATE, self._handle_generate)
+        self._dispatcher.map(OSCAddresses.CANCEL, self._handle_cancel)
+        self._dispatcher.map(OSCAddresses.ANALYZE, self._handle_analyze)
+        self._dispatcher.map(OSCAddresses.REGENERATE, self._handle_regenerate)
+        self._dispatcher.map(OSCAddresses.FX_CHAIN, self._handle_fx_chain)
+        self._dispatcher.map(OSCAddresses.CONTROLS_SET, self._handle_controls_set)
+        self._dispatcher.map(OSCAddresses.CONTROLS_CLEAR, self._handle_controls_clear)
+        self._dispatcher.map(OSCAddresses.GET_INSTRUMENTS, self._handle_get_instruments)
+        self._dispatcher.map(OSCAddresses.PING, self._handle_ping)
+        self._dispatcher.map(OSCAddresses.SHUTDOWN, self._handle_shutdown)
+        
+        # Take management handlers
+        self._dispatcher.map(OSCAddresses.SELECT_TAKE, self._handle_select_take)
+        self._dispatcher.map(OSCAddresses.COMP_TAKES, self._handle_comp_takes)
+        self._dispatcher.map(OSCAddresses.RENDER_TAKE, self._handle_render_take)
+        
+        # Expansion handlers
+        self._dispatcher.map(OSCAddresses.EXPANSION_LIST, self._handle_expansion_list)
+        self._dispatcher.map(OSCAddresses.EXPANSION_INSTRUMENTS, self._handle_expansion_instruments)
+        self._dispatcher.map(OSCAddresses.EXPANSION_RESOLVE, self._handle_expansion_resolve)
+        self._dispatcher.map(OSCAddresses.EXPANSION_IMPORT, self._handle_expansion_import)
+        self._dispatcher.map(OSCAddresses.EXPANSION_SCAN, self._handle_expansion_scan)
+        self._dispatcher.map(OSCAddresses.EXPANSION_ENABLE, self._handle_expansion_enable)
+        
+        # Default handler for unknown messages
+        self._dispatcher.set_default_handler(self._handle_unknown)
+    
+    def start(self, handle_signals: bool = True):
+        """
+        Start the server (blocking).
+        
+        This will block the current thread until shutdown is requested.
+        Use start_async() for non-blocking operation.
+        
+        Args:
+            handle_signals: Whether to setup signal handlers (disable for embedded use)
+        """
+        self._initialize()
+        
+        self._log(f"🎵 Music Generation OSC Server")
+        self._log(f"   Listening on {self.config.host}:{self.config.recv_port}")
+        self._log(f"   Sending to {self.config.host}:{self.config.send_port}")
+        self._log(f"   Press Ctrl+C to stop")
+        self._log("")
+        
+        # Setup signal handlers for graceful shutdown (only if requested)
+        # Note: In VS Code terminals, signal handling can be problematic
+        if handle_signals:
+            try:
+                signal.signal(signal.SIGINT, self._signal_handler)
+                signal.signal(signal.SIGTERM, self._signal_handler)
+            except (ValueError, OSError):
+                # Signal handling not available in this context
+                pass
+        
+        self._running = True
+        
+        try:
+            self._server.serve_forever()
+        except KeyboardInterrupt:
+            self._log("\nReceived keyboard interrupt")
+        except Exception as e:
+            self._log(f"Server error: {e}")
+        
+        # Only stop if we're still marked as running (wasn't already stopped)
+        if self._running:
+            self.stop()
+    
+    def start_async(self) -> threading.Thread:
+        """
+        Start the server in a background thread.
+        
+        Returns:
+            Thread object running the server
+        """
+        self._initialize()
+        
+        self._running = True
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="OSCServer",
+            daemon=True
+        )
+        self._server_thread.start()
+        
+        self._log(f"🎵 OSC Server started on {self.config.host}:{self.config.recv_port}")
+        
+        return self._server_thread
+    
+    def stop(self):
+        """Stop the server gracefully."""
+        if not self._running:
+            return
+        
+        self._log("Shutting down server...")
+        self._running = False
+        
+        # Shutdown workers
+        if self._gen_worker:
+            self._gen_worker.shutdown(wait=True, timeout=10.0)
+        
+        if self._instrument_worker:
+            self._instrument_worker.shutdown()
+        
+        # Shutdown OSC server
+        if self._server:
+            self._server.shutdown()
+        
+        self._log("Server stopped.")
+    
+    def is_running(self) -> bool:
+        """Check if server is running."""
+        return self._running
+    
+    def _initialize(self):
+        """Initialize server components."""
+        # Create OSC server
+        self._server = osc_server.ThreadingOSCUDPServer(
+            (self.config.host, self.config.recv_port),
+            self._dispatcher
+        )
+        
+        # Create OSC client for sending messages
+        self._client = udp_client.SimpleUDPClient(
+            self.config.host,
+            self.config.send_port
+        )
+        
+        # Create workers
+        if self._gen_worker is None:
+            self._gen_worker = GenerationWorker(
+                max_workers=self.config.max_workers,
+                progress_callback=self._on_progress,
+                completion_callback=self._on_generation_complete,
+                error_callback=self._on_error,
+            )
+        
+        self._instrument_worker = InstrumentScanWorker(
+            completion_callback=self._on_instruments_loaded,
+            error_callback=self._on_error,
+            progress_callback=self._on_progress,
+        )
+    
+    # =========================================================================
+    # OSC Message Handlers
+    # =========================================================================
+    
+    def _handle_generate(self, address: str, *args):
+        """
+        Handle /generate message.
+        
+        Expected args (JSON string):
+            {
+                "request_id": "uuid",  // For request/response correlation
+                "schema_version": 1,   // Protocol version
+                "prompt": "G-Funk beat with smooth synths",
+                "bpm": 0,           // 0 = auto
+                "key": "",          // Empty = auto
+                "output_dir": "",   // Empty = default
+                "instruments": [],  // List of paths
+                "render_audio": true,
+                "export_stems": false,
+                "export_mpc": false
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        # Parse request_id early for error correlation
+        request_id = ""
+        try:
+            if args:
+                data = json.loads(args[0]) if isinstance(args[0], str) else {}
+                request_id = data.get("request_id", "")
+                self._current_request_id = request_id
+        except:
+            pass
+        
+        # Check if already busy
+        if self._gen_worker and self._gen_worker.is_busy():
+            self._send_error(
+                ErrorCode.SERVER_BUSY,
+                "Server is busy with another generation",
+                request_id=request_id
+            )
+            return
+        
+        try:
+            # Parse JSON argument
+            if not args:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "No parameters provided", request_id=request_id)
+                return
+            
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+            
+            # Extract and validate request_id
+            request_id = data.get("request_id", "")
+            if not request_id:
+                # Protocol hardening: Require request_id
+                self._log("   ⚠️  Missing request_id in generate request. Generating temporary ID.")
+                request_id = str(uuid.uuid4())
+            
+            schema_version = data.get("schema_version", 1)
+            
+            # Schema version handling: reject major mismatches, warn on minor
+            if schema_version != SCHEMA_VERSION:
+                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+                # For major version differences (e.g., client=2, server=1), reject
+                if schema_version > SCHEMA_VERSION:
+                    self._send_error(
+                        ErrorCode.SCHEMA_VERSION_MISMATCH,
+                        f"Client schema version {schema_version} is newer than server version {SCHEMA_VERSION}. Please update the server.",
+                        request_id=request_id
+                    )
+                    return
+                # For older clients, we can try best-effort but send a warning status
+                self._send_status("schema_version_warning", {
+                    "request_id": request_id,
+                    "client_version": schema_version,
+                    "server_version": SCHEMA_VERSION,
+                    "message": f"Client uses schema v{schema_version}, server uses v{SCHEMA_VERSION}. Proceeding with best-effort compatibility."
+                })
+            
+            # Validate prompt
+            prompt = data.get("prompt", "").strip()
+            if not prompt:
+                self._send_error(ErrorCode.INVALID_PROMPT, "Prompt is required", request_id=request_id)
+                return
+
+            # Phase 5.2: accept optional controls in "options" and/or top-level
+            raw_options = data.get("options", {})
+            options: Dict[str, Any] = raw_options if isinstance(raw_options, dict) else {}
+
+            score_plan = data.get("score_plan")
+            if isinstance(score_plan, str):
+                try:
+                    score_plan = json.loads(score_plan)
+                except Exception:
+                    score_plan = None
+            if score_plan is not None and not isinstance(score_plan, dict):
+                score_plan = None
+
+            # Top-level convenience fields (mirrors CLI args/pipeline fields)
+            for k in (
+                "tension_arc_shape",
+                "tension_intensity",
+                "motif_mode",
+                "num_motifs",
+                "preset",
+                "style_preset",
+                "production_preset",
+                "orchestral_stage_preset",
+                "seed",
+            ):
+                if k in data and k not in options:
+                    options[k] = data.get(k)
+
+            # Merge persisted overrides with per-request options (per-request wins)
+            if self._control_overrides:
+                options = {**self._control_overrides, **options}
+
+            if score_plan and ("seed" not in options or options.get("seed") is None):
+                try:
+                    if "seed" in score_plan:
+                        options["seed"] = score_plan["seed"]
+                except Exception:
+                    pass
+
+            # Ensure unique seed if not provided - critical for take variation between requests
+            if "seed" not in options or options.get("seed") is None:
+                options["seed"] = int(time.time() * 1000) % (2**31)
+
+            # duration_bars can be either top-level or inside options.
+            # Backward-compat: JUCE currently sends "bars".
+            duration_bars = data.get(
+                "duration_bars",
+                data.get("bars", options.get("duration_bars", options.get("bars", 8))),
+            )
+            try:
+                duration_bars = int(duration_bars)
+            except Exception:
+                duration_bars = 8
+
+            # Take generation (optional)
+            num_takes = data.get("num_takes", options.get("num_takes", 1))
+            take_variation = data.get("take_variation", options.get("take_variation", ""))
+            try:
+                num_takes = int(num_takes)
+            except Exception:
+                num_takes = 1
+            try:
+                take_variation = str(take_variation) if take_variation is not None else ""
+            except Exception:
+                take_variation = ""
+            
+            # Parse pre-analyzed reference values from JUCE frontend
+            # These allow skipping expensive YouTube re-download when JUCE has already analyzed
+            reference_bpm = 0
+            reference_key = ""
+            reference_genre = ""
+            try:
+                reference_bpm = int(data.get("reference_bpm", 0))
+            except (ValueError, TypeError):
+                reference_bpm = 0
+            reference_key = data.get("reference_key", "")
+            reference_genre = data.get("reference_genre", "")
+            
+            # Build request with request_id
+            request = GenerationRequest(
+                prompt=prompt,
+                request_id=request_id,
+                schema_version=schema_version,
+                genre=data.get("genre", ""),  # Genre ID from JUCE GenreSelector
+                bpm=int(data.get("bpm", 0)),
+                key=data.get("key", ""),
+                duration_bars=duration_bars,
+                output_dir=data.get("output_dir", self.config.default_output_dir),
+                instruments=data.get("instruments", self.config.instrument_paths),
+                soundfont=data.get("soundfont", self.config.default_soundfont or ""),
+                render_audio=data.get("render_audio", self.config.auto_render_audio),
+                export_stems=data.get("export_stems", self.config.auto_export_stems),
+                export_mpc=data.get("export_mpc", self.config.auto_export_mpc),
+                reference_url=data.get("reference_url", ""),
+                reference_bpm=reference_bpm,
+                reference_key=reference_key,
+                reference_genre=reference_genre,
+                verbose=data.get("verbose", self.config.verbose),
+                num_takes=num_takes,
+                take_variation=take_variation,
+                options=options,
+                score_plan=score_plan,
+            )
+            
+            self._log(f"   Request ID: {request_id}" if request_id else "   Request ID: (none)")
+            self._log(f"   Genre: {request.genre}" if request.genre else "   Genre: (auto-detect)")
+            self._log(f"   Prompt: \"{request.prompt[:50]}...\"" if len(request.prompt) > 50 else f"   Prompt: \"{request.prompt}\"")
+            
+            # Optional callback
+            if self.on_generation_start:
+                self.on_generation_start(request)
+            
+            # Submit to worker
+            task_id = self._gen_worker.submit(request)
+            self._pending_generation_request = request
+            self._log(f"   Task ID: {task_id}")
+            
+            # Send acknowledgment with request_id
+            self._send_status("generation_started", {"task_id": task_id, "request_id": request_id})
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e))
+    
+    def _handle_cancel(self, address: str, *args):
+        """Handle /cancel message with request_id correlation."""
+        self._log(f"📥 Received: {address}")
+        
+        task_id = args[0] if args else None
+        
+        # Capture request_id before cancellation clears it
+        request_id = self._current_request_id or ""
+        
+        if self._gen_worker:
+            cancelled = self._gen_worker.cancel(task_id)
+            if cancelled:
+                self._log("   Generation cancelled")
+                # Include request_id in cancel status for correlation
+                self._send_status("cancelled", {
+                    "task_id": task_id,
+                    "request_id": request_id,
+                })
+                # Clear current request after sending status
+                self._current_request_id = None
+            else:
+                self._send_error(
+                    ErrorCode.UNKNOWN,
+                    "No active generation to cancel",
+                    request_id=request_id
+                )
+    
+    def _handle_analyze(self, address: str, *args):
+        """Handle /analyze message for analyzing existing files."""
+        self._log(f"📥 Received: {address}")
+
+        # Parse request_id early for error correlation
+        request_id = ""
+        try:
+            if args:
+                data = json.loads(args[0]) if isinstance(args[0], str) else {}
+                request_id = data.get("request_id", "")
+        except Exception:
+            data = {}
+
+        try:
+            if not args:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "No parameters provided", request_id=request_id)
+                return
+
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+
+            request_id = data.get("request_id", "")
+            schema_version = int(data.get("schema_version", 1))
+
+            if schema_version != SCHEMA_VERSION:
+                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+
+            source_url = (data.get("url") or "").strip()
+            source_path = (data.get("path") or "").strip()
+            verbose = bool(data.get("verbose", self.config.verbose))
+
+            if not source_url and not source_path:
+                self._send_error(
+                    ErrorCode.MISSING_PARAMETER,
+                    "Analyze requires either 'url' or 'path'",
+                    request_id=request_id,
+                )
+                return
+
+            if source_path:
+                path = Path(source_path)
+                if not path.exists():
+                    self._send_error(
+                        ErrorCode.FILE_NOT_FOUND,
+                        f"File not found: {source_path}",
+                        request_id=request_id,
+                    )
+                    return
+
+                is_midi = path.suffix.lower() in (".mid", ".midi")
+
+                if is_midi:
+                    # MIDI files: use file_analysis (no librosa needed)
+                    from ..file_analysis import analyze_path as fa_analyze_path
+                    fa_result = fa_analyze_path(
+                        str(path), request_id=request_id,
+                        progress=lambda step, pct, msg: self._on_progress(
+                            step, pct, msg
+                        ) if verbose else None,
+                    )
+                    analysis_dict = fa_result.to_dict()
+                    response: Dict[str, Any] = {
+                        "request_id": request_id,
+                        "schema_version": schema_version,
+                        "success": True,
+                        "source_kind": "file",
+                        "analyzer": "file_analysis",
+                        "analysis": analysis_dict,
+                        "prompt_hints": fa_result.prompt_suggestion,
+                        "generation_params": {
+                            "bpm": fa_result.bpm_estimate,
+                            "key": fa_result.key_estimate,
+                            "mode": fa_result.mode_estimate,
+                        },
+                    }
+                    if fa_result.warnings:
+                        response["warnings"] = fa_result.warnings
+                    self._send_message(OSCAddresses.ANALYZE_RESULT, json.dumps(response))
+                    return
+
+                # Local audio file: try reference_analyzer first, fall back to file_analysis
+                try:
+                    from ..reference_analyzer import ReferenceAnalyzer
+                    analyzer = ReferenceAnalyzer(verbose=verbose)
+                    analysis = analyzer.analyze_file(str(path))
+                    source_kind = "file"
+                except ImportError:
+                    # librosa not available — fall back to lightweight file_analysis
+                    self._log("   ℹ️ librosa not available, using lightweight file analysis")
+                    from ..file_analysis import analyze_path as fa_analyze_path
+                    fa_result = fa_analyze_path(
+                        str(path), request_id=request_id,
+                        progress=lambda step, pct, msg: self._on_progress(
+                            step, pct, msg
+                        ) if verbose else None,
+                    )
+                    analysis_dict = fa_result.to_dict()
+                    response = {
+                        "request_id": request_id,
+                        "schema_version": schema_version,
+                        "success": True,
+                        "source_kind": "file",
+                        "analyzer": "file_analysis",
+                        "analysis": analysis_dict,
+                        "prompt_hints": fa_result.prompt_suggestion,
+                        "generation_params": {
+                            "bpm": fa_result.bpm_estimate,
+                            "key": fa_result.key_estimate,
+                            "mode": fa_result.mode_estimate,
+                        },
+                    }
+                    if fa_result.warnings:
+                        response["warnings"] = fa_result.warnings
+                    self._send_message(OSCAddresses.ANALYZE_RESULT, json.dumps(response))
+                    return
+            else:
+                # URL analysis: requires reference_analyzer (librosa + yt-dlp)
+                try:
+                    from ..reference_analyzer import ReferenceAnalyzer
+                    analyzer = ReferenceAnalyzer(verbose=verbose)
+                    analysis = analyzer.analyze_url(source_url)
+                    source_kind = "url"
+                except ImportError as e:
+                    dep_name = "librosa" if "librosa" in str(e) else "yt-dlp"
+                    install_cmd = f"pip install {dep_name}"
+                    self._send_error(
+                        ErrorCode.OPTIONAL_DEPENDENCY_MISSING,
+                        f"URL analysis requires {dep_name}. Install with: {install_cmd}",
+                        request_id=request_id,
+                    )
+                    return
+
+            def _to_jsonable(obj: Any) -> Any:
+                if dataclasses.is_dataclass(obj):
+                    return {k: _to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
+                if isinstance(obj, Enum):
+                    return obj.value
+                if isinstance(obj, (list, tuple)):
+                    return [_to_jsonable(v) for v in obj]
+                if isinstance(obj, dict):
+                    return {str(k): _to_jsonable(v) for k, v in obj.items()}
+                return obj
+
+            analysis_dict = _to_jsonable(analysis)
+
+            response: Dict[str, Any] = {
+                "request_id": request_id,
+                "schema_version": schema_version,
+                "success": True,
+                "source_kind": source_kind,
+                "analysis": analysis_dict,
+                "prompt_hints": analysis.to_prompt_hints(include_genre=False),
+                "generation_params": analysis.to_generation_params(),
+            }
+
+            self._send_message(OSCAddresses.ANALYZE_RESULT, json.dumps(response))
+
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}", request_id=request_id)
+        except ImportError as e:
+            # librosa / yt-dlp are optional; surface a clear, actionable message
+            dep_name = "librosa" if "librosa" in str(e) else ("yt-dlp" if "yt" in str(e).lower() else "unknown")
+            install_cmd = f"pip install {dep_name}" if dep_name != "unknown" else str(e)
+            self._send_error(
+                ErrorCode.OPTIONAL_DEPENDENCY_MISSING,
+                f"Analysis requires {dep_name}. Install with: {install_cmd}",
+                request_id=request_id,
+            )
+        except Exception as e:
+            self._send_error(ErrorCode.ANALYZE_FAILED, f"Analysis error: {e}", request_id=request_id)
+    
+    def _handle_regenerate(self, address: str, *args):
+        """
+        Handle /regenerate message for sectional regeneration.
+        
+        Regenerates a specific bar range of the current project.
+        
+        Expected args (JSON string):
+            {
+                "schema_version": 1,
+                "request_id": "uuid",
+                "start_bar": 4,      // 0-indexed bar to start regeneration
+                "end_bar": 8,        // 0-indexed bar to end (exclusive)
+                "tracks": ["drums", "bass"],  // Optional: which tracks to regenerate
+                "seed_strategy": "new",  // "new" for fresh seed, "derived" to vary existing
+                "prompt": "optional override prompt for this section",
+                "options": {}
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        request_id = ""
+        try:
+            if not args:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "No parameters provided")
+                return
+            
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+            
+            request_id = data.get("request_id", str(uuid.uuid4()))
+            schema_version = int(data.get("schema_version", 1))
+            
+            # Validate schema version
+            if schema_version > SCHEMA_VERSION:
+                self._send_error(
+                    ErrorCode.SCHEMA_VERSION_MISMATCH,
+                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
+                    request_id=request_id
+                )
+                return
+            
+            start_bar = int(data.get("start_bar", 0))
+            end_bar = int(data.get("end_bar", start_bar + 4))
+            tracks = data.get("tracks", [])  # Empty = all tracks
+            seed_strategy = data.get("seed_strategy", "new")
+            prompt_override = data.get("prompt", "")
+            raw_options = data.get("options", {})
+            options: Dict[str, Any] = raw_options if isinstance(raw_options, dict) else {}
+
+            # Merge persisted overrides (Phase 5.2) with per-request options (per-request wins)
+            if self._control_overrides:
+                options = {**self._control_overrides, **options}
+            
+            # Validate bar range
+            if start_bar < 0 or end_bar <= start_bar:
+                self._send_error(
+                    ErrorCode.INVALID_MESSAGE,
+                    f"Invalid bar range: {start_bar}-{end_bar}",
+                    request_id=request_id
+                )
+                return
+            
+            self._log(f"   Regenerating bars {start_bar}-{end_bar}, tracks={tracks or 'all'}")
+            
+            # Check if worker is busy
+            if self._gen_worker and self._gen_worker.is_busy():
+                self._send_error(
+                    ErrorCode.GENERATION_FAILED,
+                    "Generation worker is busy. Cancel current generation first.",
+                    request_id=request_id
+                )
+                return
+            
+            # Build regeneration request - this is a specialized generate request
+            from ..prompt_parser import PromptParser
+            
+            # Get base parameters from current state or use defaults
+            base_bpm = options.get("bpm", 92)
+            base_key = options.get("key", "C")
+            base_mode = options.get("mode", "minor")
+            
+            # Parse prompt for additional parameters
+            parser = PromptParser()
+            parsed = parser.parse(prompt_override) if prompt_override else parser.parse("")
+            
+            # Build request with regeneration metadata
+            from .worker import GenerationRequest
+            
+            regen_request = GenerationRequest(
+                request_id=request_id,
+                prompt=prompt_override or parsed.raw_prompt,
+                bpm=parsed.bpm or base_bpm,
+                key=parsed.key or base_key,
+                mode=parsed.mode or base_mode,
+                duration_bars=end_bar - start_bar,
+                genre=parsed.genre or options.get("genre", ""),
+                options={
+                    **options,
+                    "regeneration": True,
+                    "start_bar": start_bar,
+                    "end_bar": end_bar,
+                    "target_tracks": tracks,
+                    "seed_strategy": seed_strategy,
+                }
+            )
+            
+            # Send status update
+            self._send_status("regeneration_started", {
+                "request_id": request_id,
+                "start_bar": start_bar,
+                "end_bar": end_bar,
+                "tracks": tracks
+            }, request_id=request_id)
+            
+            # Submit to worker
+            self._gen_worker.submit(regen_request)
+            self._pending_generation_request = regen_request
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}", request_id=request_id)
+        except Exception as e:
+            self._log(f"⚠️  Regenerate error: {e}")
+            self._send_error(ErrorCode.UNKNOWN, str(e), request_id=request_id)
+    
+    def _handle_fx_chain(self, address: str, *args):
+        """
+        Handle /fx_chain message for FX chain configuration.
+        
+        Stores the FX chain configuration to be applied during generation/rendering.
+        
+        Expected args (JSON string):
+            {
+                "schema_version": 1,
+                "fx_chain": {
+                    "master": [{"type": "eq", "enabled": true, "params": {...}}, ...],
+                    "drums": [...],
+                    "bass": [...],
+                    "melodic": [...]
+                }
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        try:
+            if not args:
+                self._log("   ⚠️  No FX chain data provided")
+                return
+            
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+            schema_version = int(data.get("schema_version", 1))
+            fx_chain = data.get("fx_chain", {})
+            
+            if schema_version > SCHEMA_VERSION:
+                self._log(f"   ⚠️ Schema version mismatch: client={schema_version}, server={SCHEMA_VERSION}")
+            
+            # Store FX chain configuration for use during generation
+            self._current_fx_chain = fx_chain
+            
+            # Log summary
+            chain_summary = []
+            for track, effects in fx_chain.items():
+                if effects:
+                    chain_summary.append(f"{track}({len(effects)} fx)")
+            
+            self._log(f"   🎛️  FX chain stored: {', '.join(chain_summary) or 'empty'}")
+            
+            # Send acknowledgment
+            self._send_status("fx_chain_received", {
+                "tracks": list(fx_chain.keys()),
+                "total_effects": sum(len(v) for v in fx_chain.values())
+            })
+            
+        except json.JSONDecodeError as e:
+            self._log(f"   ⚠️  Invalid FX chain JSON: {e}")
+        except Exception as e:
+            self._log(f"   ⚠️  FX chain error: {e}")
+
+    def _handle_controls_set(self, address: str, *args):
+        """Handle /controls/set to persistently store generation overrides.
+
+        Expected args (JSON string):
+            {
+              "schema_version": 1,
+              "request_id": "uuid",
+              "overrides": {
+                 "tension_arc_shape": "linear_build",
+                 "tension_intensity": 0.8,
+                 "motif_mode": "on",          // auto|on|off
+                 "num_motifs": 2,
+                 "preset": "legendary",
+                 "style_preset": "g_funk_90s",
+                 "production_preset": "wide_modern",
+                 "duration_bars": 8,
+                 "seed": 123,
+                 "num_takes": 1,
+                 "take_variation": "timing"
+              }
+            }
+        """
+        self._log(f"📥 Received: {address}")
+
+        request_id = ""
+        try:
+            if not args:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "No parameters provided")
+                return
+
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+
+            request_id = data.get("request_id", str(uuid.uuid4()))
+            schema_version = int(data.get("schema_version", 1))
+            if schema_version > SCHEMA_VERSION:
+                self._send_error(
+                    ErrorCode.SCHEMA_VERSION_MISMATCH,
+                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
+                    request_id=request_id,
+                )
+                return
+
+            raw_overrides = data.get("overrides", {})
+            overrides = raw_overrides if isinstance(raw_overrides, dict) else {}
+
+            allowed_keys = {
+                "tension_arc_shape",
+                "tension_intensity",
+                "motif_mode",
+                "num_motifs",
+                "preset",
+                "style_preset",
+                "production_preset",
+                "duration_bars",
+                "seed",
+                "num_takes",
+                "take_variation",
+            }
+
+            updated: Dict[str, Any] = {}
+            for k, v in overrides.items():
+                if k in allowed_keys:
+                    self._control_overrides[k] = v
+                    updated[k] = v
+
+            self._send_status(
+                "controls_updated",
+                {"request_id": request_id, "updated": updated, "overrides": self._control_overrides},
+                request_id=request_id,
+            )
+
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}", request_id=request_id)
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e), request_id=request_id)
+
+    def _handle_controls_clear(self, address: str, *args):
+        """Handle /controls/clear to remove persisted overrides.
+
+        Expected args (JSON string):
+            {
+              "schema_version": 1,
+              "request_id": "uuid",
+              "keys": ["tension_intensity", "motif_mode"]  // optional
+            }
+        If keys are omitted/empty, clears all overrides.
+        """
+        self._log(f"📥 Received: {address}")
+
+        request_id = ""
+        try:
+            if not args:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "No parameters provided")
+                return
+
+            data = json.loads(args[0]) if isinstance(args[0], str) else {}
+
+            request_id = data.get("request_id", str(uuid.uuid4()))
+            schema_version = int(data.get("schema_version", 1))
+            if schema_version > SCHEMA_VERSION:
+                self._send_error(
+                    ErrorCode.SCHEMA_VERSION_MISMATCH,
+                    f"Client schema {schema_version} is newer than server {SCHEMA_VERSION}",
+                    request_id=request_id,
+                )
+                return
+
+            keys = data.get("keys")
+            cleared: List[str] = []
+            if keys and isinstance(keys, list):
+                for k in keys:
+                    ks = str(k)
+                    if ks in self._control_overrides:
+                        self._control_overrides.pop(ks, None)
+                        cleared.append(ks)
+            else:
+                cleared = list(self._control_overrides.keys())
+                self._control_overrides.clear()
+
+            self._send_status(
+                "controls_cleared",
+                {"request_id": request_id, "cleared": cleared, "overrides": self._control_overrides},
+                request_id=request_id,
+            )
+
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}", request_id=request_id)
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e), request_id=request_id)
+    
+    def _handle_get_instruments(self, address: str, *args):
+        """
+        Handle /instruments message.
+        
+        Expected args (JSON string):
+            {
+                "paths": ["path/to/kit1", "path/to/kit2"],
+                "cache_dir": "optional/cache/dir"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            paths = data.get("paths", [])
+            cache_dir = data.get("cache_dir", str(Path(self.config.default_output_dir)))
+            
+            # If no paths provided, use default configured paths
+            if not paths:
+                paths = self.config.instrument_paths
+                
+            if not paths:
+                self._send_error(
+                    ErrorCode.MISSING_PARAMETER,
+                    "No instrument paths provided and no defaults configured"
+                )
+                return
+            
+            self._log(f"   Scanning {len(paths)} directories...")
+            
+            scan_id = self._instrument_worker.scan(paths, cache_dir)
+            self._send_status("scan_started", {"scan_id": scan_id})
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e))
+    
+    def _handle_ping(self, address: str, *args):
+        """Handle /ping message for health check."""
+        self._send_message(OSCAddresses.PONG, json.dumps({
+            "status": "ok",
+            "busy": self._gen_worker.is_busy() if self._gen_worker else False,
+            "timestamp": time.time(),
+            "schema_version": SCHEMA_VERSION,
+        }))
+    
+    def _handle_shutdown(self, address: str, *args):
+        """
+        Handle /shutdown message for graceful shutdown.
+        
+        Expected args (JSON string):
+            {
+                "request_id": "uuid"  // For acknowledgment correlation
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        # Parse request_id from shutdown request
+        request_id = ""
+        try:
+            if args:
+                data = json.loads(args[0]) if isinstance(args[0], str) else {}
+                request_id = data.get("request_id", "")
+        except:
+            pass
+        
+        # Send acknowledgment with request_id
+        self._send_status("shutdown_acknowledged", {
+            "request_id": request_id,
+            "timestamp": time.time(),
+        })
+        
+        # Schedule shutdown on main thread (allow time for ack to be sent)
+        def delayed_shutdown():
+            time.sleep(0.5)  # Give 500ms for acknowledgment to be sent
+            self.stop()
+        
+        threading.Thread(target=delayed_shutdown, daemon=True).start()
+    
+    def _handle_unknown(self, address: str, *args):
+        """Handle unknown OSC messages."""
+        self._log(f"⚠️  Unknown message: {address} {args}")
+    
+    # =========================================================================
+    # Expansion Handlers
+    # =========================================================================
+    
+    def _handle_expansion_list(self, address: str, *args):
+        """Handle /expansion/list - return list of loaded expansions."""
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            expansions = self._expansion_manager.list_expansions()
+            categories = self._expansion_manager.get_categories()
+            
+            response = {
+                "expansions": expansions,
+                "categories": categories,
+            }
+            
+            self._send_message(OSCAddresses.EXPANSION_LIST_RESPONSE, json.dumps(response))
+            self._log(f"   Sent {len(expansions)} expansions")
+            
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to list expansions: {e}")
+    
+    def _handle_expansion_instruments(self, address: str, *args):
+        """
+        Handle /expansion/instruments - list instruments in an expansion.
+        
+        Expected args (JSON string):
+            {
+                "expansion_id": "funk_o_rama"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            expansion_id = data.get("expansion_id", "")
+            
+            instruments = self._expansion_manager.list_instruments(expansion_id=expansion_id)
+
+            payload = json.dumps(instruments)
+
+            # Large expansions can exceed UDP datagram limits (WinError 10040). If needed,
+            # send as a sequence of chunk messages that the client reassembles.
+            max_chunk_chars = 8000
+            if len(payload) <= max_chunk_chars:
+                self._send_message(OSCAddresses.EXPANSION_INSTRUMENTS_RESPONSE, payload)
+                self._log(f"   Sent {len(instruments)} instruments for {expansion_id}")
+            else:
+                total = (len(payload) + max_chunk_chars - 1) // max_chunk_chars
+                for idx in range(total):
+                    chunk = payload[idx * max_chunk_chars : (idx + 1) * max_chunk_chars]
+                    self._send_message(OSCAddresses.EXPANSION_INSTRUMENTS_CHUNK, expansion_id, idx, total, chunk)
+                self._log(f"   Sent {len(instruments)} instruments for {expansion_id} in {total} chunks")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to list instruments: {e}")
+    
+    def _handle_expansion_resolve(self, address: str, *args):
+        """
+        Handle /expansion/resolve - resolve instrument with intelligent matching.
+        
+        Expected args (JSON string):
+            {
+                "instrument": "krar",
+                "genre": "eskista"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            instrument = data.get("instrument", "")
+            genre = data.get("genre", "")
+            
+            if not instrument:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "Instrument name required")
+                return
+            
+            result = self._expansion_manager.resolve_instrument(instrument, genre)
+            
+            self._send_message(OSCAddresses.EXPANSION_RESOLVE_RESPONSE, json.dumps(result.to_dict()))
+            self._log(f"   Resolved '{instrument}' -> '{result.name}' ({result.match_type.value})")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to resolve instrument: {e}")
+    
+    def _handle_expansion_import(self, address: str, *args):
+        """
+        Handle /expansion/import - import a new expansion pack.
+        
+        Expected args (JSON string):
+            {
+                "path": "/path/to/expansion"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            path = data.get("path", "")
+            
+            if not path:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "Expansion path required")
+                return
+            
+            success = self._expansion_manager.add_expansion(path)
+            
+            if success:
+                self._send_status("expansion_imported", {"path": path})
+                self._log(f"   Imported expansion from: {path}")
+            else:
+                self._send_error(ErrorCode.UNKNOWN, f"Failed to import expansion from: {path}")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to import expansion: {e}")
+    
+    def _handle_expansion_scan(self, address: str, *args):
+        """
+        Handle /expansion/scan - scan directory for expansions.
+        
+        Expected args (JSON string):
+            {
+                "directory": "/path/to/expansions"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            directory = data.get("directory", "")
+            
+            if not directory:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "Directory path required")
+                return
+            
+            count = self._expansion_manager.scan_expansions(directory)
+            
+            self._send_status("expansion_scan_complete", {
+                "directory": directory,
+                "count": count,
+            })
+            self._log(f"   Scanned {directory}: found {count} expansions")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to scan expansions: {e}")
+    
+    def _handle_expansion_enable(self, address: str, *args):
+        """
+        Handle /expansion/enable - enable or disable an expansion.
+        
+        Expected args (JSON string):
+            {
+                "expansion_id": "funk_o_rama",
+                "enabled": true
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        if not self._expansion_manager:
+            self._send_error(ErrorCode.UNKNOWN, "Expansion manager not available")
+            return
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            expansion_id = data.get("expansion_id", "")
+            enabled = data.get("enabled", True)
+            
+            if not expansion_id:
+                self._send_error(ErrorCode.MISSING_PARAMETER, "Expansion ID required")
+                return
+            
+            self._expansion_manager.enable_expansion(expansion_id, enabled)
+            
+            self._send_status("expansion_enable_changed", {
+                "expansion_id": expansion_id,
+                "enabled": enabled,
+            })
+            self._log(f"   Expansion '{expansion_id}' enabled={enabled}")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, f"Failed to change expansion state: {e}")
+    
+    # =========================================================================
+    # Take Management Handlers
+    # =========================================================================
+    
+    def _handle_select_take(self, address: str, *args):
+        """
+        Handle /take/select - select a specific take for a track.
+        
+        Expected args (JSON string):
+            {
+                "request_id": "uuid",
+                "track": "drums",
+                "take_id": "take_001"
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            request_id = data.get("request_id", "")
+            track = data.get("track", "")
+            take_id = data.get("take_id", "")
+            
+            if not track or not take_id:
+                self._send_error(ErrorCode.MISSING_PARAMETER, 
+                                 "track and take_id required", 
+                                 request_id=request_id)
+                return
+            
+            # Store selected take (will be used during render)
+            self._selected_takes[track] = take_id
+            
+            self._send_message(OSCAddresses.TAKE_SELECTED, json.dumps({
+                "request_id": request_id,
+                "track": track,
+                "take_id": take_id,
+                "success": True
+            }))
+            
+            self._log(f"   🎬 Selected take '{take_id}' for track '{track}'")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e))
+    
+    def _handle_comp_takes(self, address: str, *args):
+        """
+        Handle /take/comp - composite takes across bar regions.
+        
+        Expected args (JSON string):
+            {
+                "request_id": "uuid",
+                "track": "drums",
+                "regions": [
+                    {"start_bar": 0, "end_bar": 4, "take_id": "take_001"},
+                    {"start_bar": 4, "end_bar": 8, "take_id": "take_002"}
+                ]
+            }
+        """
+        self._log(f"📥 Received: {address}")
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            request_id = data.get("request_id", "")
+            track = data.get("track", "")
+            regions = data.get("regions", [])
+            
+            if not track:
+                self._send_error(ErrorCode.MISSING_PARAMETER, 
+                                 "track required", 
+                                 request_id=request_id)
+                return
+            
+            if not regions:
+                self._send_error(ErrorCode.MISSING_PARAMETER, 
+                                 "regions array required", 
+                                 request_id=request_id)
+                return
+            
+            # Validate regions
+            for region in regions:
+                if "start_bar" not in region or "end_bar" not in region or "take_id" not in region:
+                    self._send_error(ErrorCode.INVALID_MESSAGE, 
+                                     "Each region requires start_bar, end_bar, take_id",
+                                     request_id=request_id)
+                    return
+            
+            # Store comp regions for the track
+            self._comp_regions[track] = regions
+            
+            self._send_status("comp_regions_set", {
+                "request_id": request_id,
+                "track": track,
+                "region_count": len(regions),
+            })
+            
+            self._log(f"   🎬 Set {len(regions)} comp regions for track '{track}'")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e))
+
+    @staticmethod
+    def _normalize_take_id(take_id: Any) -> Optional[int]:
+        """Normalize frontend take IDs like ``1`` or ``take_001`` to an integer."""
+        text = "" if take_id is None else str(take_id).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            value = int(text)
+            return value if value > 0 else None
+        match = _TAKE_ID_RE.fullmatch(text)
+        if not match:
+            return None
+        value = int(match.group("take"))
+        return value if value > 0 else None
+
+    @staticmethod
+    def _get_track_name(track: Any) -> str:
+        """Return a normalized MIDI track name."""
+        try:
+            return str(getattr(track, "name", "") or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_take_track_name(track_name: str) -> Optional[Dict[str, Any]]:
+        """Parse generated take/comp track names from the cached project MIDI."""
+        name = str(track_name or "").strip()
+        if not name:
+            return None
+
+        take_match = _TAKE_TRACK_RE.fullmatch(name)
+        if take_match:
+            return {
+                "original": take_match.group("original"),
+                "kind": "take",
+                "take_number": int(take_match.group("take")),
+            }
+
+        comp_match = _COMP_TRACK_RE.fullmatch(name)
+        if comp_match:
+            return {
+                "original": comp_match.group("original"),
+                "kind": "comp",
+                "take_number": None,
+            }
+
+        return None
+
+    @staticmethod
+    def _resolve_mapping_key(mapping: Dict[str, Any], key: str) -> Optional[str]:
+        """Resolve a mapping key case-insensitively while preserving canonical casing."""
+        text = str(key or "").strip()
+        if not text:
+            return None
+        if text in mapping:
+            return text
+
+        lowered = text.casefold()
+        for existing_key in mapping.keys():
+            if str(existing_key).strip().casefold() == lowered:
+                return existing_key
+
+        return None
+
+    @staticmethod
+    def _clone_midi_track(track: Any):
+        """Deep-copy a MIDI track for temporary arrangement rendering."""
+        import mido
+
+        cloned = mido.MidiTrack()
+        for msg in track:
+            cloned.append(msg.copy())
+        return cloned
+
+    def _has_comp_regions_for_track(self, track_name: str) -> bool:
+        """Return True when frontend-only comp regions exist for a track."""
+        return self._resolve_mapping_key(self._comp_regions, track_name) is not None
+
+    def _selected_take_number_for_track(self, track_name: str) -> Optional[int]:
+        """Resolve a stored frontend selection to a concrete take number."""
+        selected_key = self._resolve_mapping_key(self._selected_takes, track_name)
+        if selected_key is None:
+            return None
+
+        selected_value = self._selected_takes.get(selected_key)
+        normalized_take = self._normalize_take_id(selected_value)
+        if normalized_take is None:
+            raise ValueError(
+                f"Selected take '{selected_value}' for track '{track_name}' is invalid"
+            )
+        return normalized_take
+
+    def _collect_take_families(self, midi_file: Any) -> Dict[str, Dict[str, Any]]:
+        """Collect generated take families and optional comp tracks from a MIDI file."""
+        families: Dict[str, Dict[str, Any]] = {}
+
+        for track in midi_file.tracks:
+            family_info = self._parse_take_track_name(self._get_track_name(track))
+            if family_info is None:
+                continue
+
+            original_name = family_info["original"]
+            family = families.setdefault(original_name, {"takes": {}, "comp": None})
+
+            if family_info["kind"] == "comp":
+                family["comp"] = track
+            else:
+                family["takes"][family_info["take_number"]] = track
+
+        return families
+
+    def _select_family_track(
+        self,
+        original_name: str,
+        family: Dict[str, Any],
+        *,
+        use_comp: bool,
+        requested_take_number: Optional[int] = None,
+        explicit_track_requested: bool = False,
+    ):
+        """Choose the concrete MIDI track to render for one take family."""
+        takes = family.get("takes", {})
+        comp_track = family.get("comp")
+
+        if requested_take_number is not None:
+            requested_track = takes.get(requested_take_number)
+            if requested_track is None:
+                raise ValueError(
+                    f"Requested take '{requested_take_number}' not found for track '{original_name}'"
+                )
+            return requested_track
+
+        if explicit_track_requested and use_comp:
+            if comp_track is not None:
+                return comp_track
+            if self._has_comp_regions_for_track(original_name):
+                raise ValueError(
+                    f"Track '{original_name}' has comp regions but no renderable comp track"
+                )
+            raise ValueError(f"Comp track not found for track '{original_name}'")
+
+        if use_comp and comp_track is not None:
+            return comp_track
+
+        selected_take_number = self._selected_take_number_for_track(original_name)
+        if selected_take_number is not None:
+            selected_track = takes.get(selected_take_number)
+            if selected_track is None:
+                raise ValueError(
+                    f"Requested take '{selected_take_number}' not found for track '{original_name}'"
+                )
+            return selected_track
+
+        default_track = takes.get(1)
+        if default_track is None:
+            raise ValueError(f"Take_1 not found for track '{original_name}'")
+
+        return default_track
+
+    def _build_take_render_midi(self, midi_file: Any, selected_tracks: Dict[str, Any]):
+        """Build a temporary whole-project MIDI using the chosen take per family."""
+        import mido
+
+        rendered_mid = mido.MidiFile(ticks_per_beat=midi_file.ticks_per_beat)
+        emitted_families = set()
+
+        for track in midi_file.tracks:
+            family_info = self._parse_take_track_name(self._get_track_name(track))
+            if family_info is None:
+                rendered_mid.tracks.append(self._clone_midi_track(track))
+                continue
+
+            original_name = family_info["original"]
+            if original_name in emitted_families:
+                continue
+
+            chosen_track = selected_tracks.get(original_name)
+            if chosen_track is None:
+                continue
+
+            rendered_mid.tracks.append(self._clone_midi_track(chosen_track))
+            emitted_families.add(original_name)
+
+        return rendered_mid
+
+    @staticmethod
+    def _safe_filename_fragment(value: str, default: str) -> str:
+        """Create a filesystem-friendly filename fragment."""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+        cleaned = cleaned.strip("._-")
+        return cleaned or default
+
+    def _build_render_filename(self, midi_path: Path, track: str, take_id: str, use_comp: bool) -> str:
+        """Build a truthful output filename for rendered take requests."""
+        project_name = self._safe_filename_fragment(midi_path.stem, "project")
+        filename_parts = [project_name]
+
+        if track:
+            filename_parts.append(self._safe_filename_fragment(track, "track"))
+
+        normalized_take = self._normalize_take_id(take_id)
+        if normalized_take is not None:
+            filename_parts.append(f"take_{normalized_take:03d}")
+        elif track and use_comp:
+            filename_parts.append("comp")
+        elif use_comp:
+            filename_parts.append("selected_comp")
+        else:
+            filename_parts.append("selected_takes")
+
+        return "_".join(filename_parts) + ".wav"
+
+    def _resolve_render_output_path(
+        self,
+        requested_output_path: str,
+        midi_path: Path,
+        cached_request: Optional[GenerationRequest],
+        *,
+        track: str,
+        take_id: str,
+        use_comp: bool,
+    ) -> Path:
+        """Resolve the caller's output_path into a concrete WAV file path."""
+        default_parent = midi_path.parent
+        if cached_request and cached_request.output_dir:
+            default_parent = Path(cached_request.output_dir)
+
+        filename = self._build_render_filename(midi_path, track, take_id, use_comp)
+        requested_text = str(requested_output_path or "").strip()
+
+        if not requested_text:
+            default_parent.mkdir(parents=True, exist_ok=True)
+            return default_parent / filename
+
+        requested_path = Path(requested_text)
+        if requested_path.suffix.lower() == ".wav":
+            requested_path.parent.mkdir(parents=True, exist_ok=True)
+            return requested_path
+
+        requested_path.mkdir(parents=True, exist_ok=True)
+        return requested_path / filename
+
+    def _create_audio_renderer(
+        self,
+        cached_request: Optional[GenerationRequest],
+        cached_result: GenerationResult,
+    ):
+        """Create a renderer for truthful whole-project take rendering."""
+        from ..audio_renderer import AudioRenderer
+
+        metadata = cached_result.metadata if isinstance(cached_result.metadata, dict) else {}
+        genre = metadata.get("genre")
+        if cached_request and cached_request.genre:
+            genre = cached_request.genre
+
+        soundfont_path = self.config.default_soundfont or None
+        if cached_request and cached_request.soundfont:
+            soundfont_path = cached_request.soundfont
+
+        return AudioRenderer(
+            soundfont_path=soundfont_path,
+            expansion_manager=self._expansion_manager,
+            genre=genre,
+            ai_metadata={
+                "source_task_id": cached_result.task_id,
+                "source_request_id": cached_result.request_id,
+                "source_midi_path": cached_result.midi_path,
+            },
+        )
+    
+    def _handle_render_take(self, address: str, *args):
+        """
+        Handle /take/render - render a truthful whole-project arrangement to audio.
+        
+        Expected args (JSON string):
+            {
+                "request_id": "uuid",
+                "track": "drums",         # Optional: override one take family
+                "take_id": "take_001",   # Optional explicit take override
+                "use_comp": false,         # Prefer actual *_Comp tracks when available
+                "output_path": "path/to/output.wav/or/directory"
+            }
+
+        The current live JUCE request shape (trackless use_comp=true with an output
+        directory) is accepted and renders the latest whole-project arrangement.
+        """
+        self._log(f"📥 Received: {address}")
+        
+        try:
+            data = json.loads(args[0]) if args else {}
+            request_id = data.get("request_id", "")
+            track = str(data.get("track", "") or "").strip()
+            take_id = str(data.get("take_id", "") or "").strip()
+            use_comp = bool(data.get("use_comp", False))
+            output_path = str(data.get("output_path", "") or "").strip()
+
+            requested_take_number = None
+            if take_id:
+                requested_take_number = self._normalize_take_id(take_id)
+                if requested_take_number is None:
+                    self._send_error(
+                        ErrorCode.INVALID_MESSAGE,
+                        f"Invalid take_id '{take_id}'",
+                        request_id=request_id,
+                    )
+                    return
+                if not track:
+                    self._send_error(
+                        ErrorCode.MISSING_PARAMETER,
+                        "track required when take_id is provided",
+                        request_id=request_id,
+                    )
+                    return
+
+            if track and not take_id and not use_comp:
+                self._send_error(
+                    ErrorCode.MISSING_PARAMETER,
+                    "take_id required when rendering a specific track without use_comp",
+                    request_id=request_id,
+                )
+                return
+
+            cached_context = self._last_render_context or {}
+            cached_result = cached_context.get("result")
+            cached_request = cached_context.get("request")
+
+            if not cached_result or not cached_result.success or not cached_result.midi_path:
+                self._send_error(
+                    ErrorCode.GENERATION_FAILED,
+                    "No prior successful generation with cached MIDI is available to render",
+                    request_id=request_id,
+                )
+                return
+
+            midi_path = Path(cached_result.midi_path)
+            if not midi_path.exists():
+                self._send_error(
+                    ErrorCode.FILE_NOT_FOUND,
+                    f"Cached MIDI file not found: {midi_path}",
+                    request_id=request_id,
+                )
+                return
+
+            try:
+                import mido
+            except ImportError as e:
+                self._send_error(
+                    ErrorCode.OPTIONAL_DEPENDENCY_MISSING,
+                    f"MIDI take rendering requires mido: {e}",
+                    request_id=request_id,
+                )
+                return
+
+            try:
+                midi_file = mido.MidiFile(str(midi_path))
+            except Exception as e:
+                self._send_error(
+                    ErrorCode.GENERATION_FAILED,
+                    f"Failed to load cached MIDI: {e}",
+                    request_id=request_id,
+                )
+                return
+
+            families = self._collect_take_families(midi_file)
+            if not any(family.get("takes") for family in families.values()):
+                self._send_error(
+                    ErrorCode.GENERATION_FAILED,
+                    "No take tracks available in cached MIDI",
+                    request_id=request_id,
+                )
+                return
+
+            resolved_track = self._resolve_mapping_key(families, track) if track else None
+            if track and resolved_track is None:
+                self._send_error(
+                    ErrorCode.INVALID_MESSAGE,
+                    f"Requested track '{track}' not found",
+                    request_id=request_id,
+                )
+                return
+
+            try:
+                selected_tracks: Dict[str, Any] = {}
+                for original_name, family in families.items():
+                    explicit_override = bool(resolved_track) and original_name == resolved_track
+                    selected_tracks[original_name] = self._select_family_track(
+                        original_name,
+                        family,
+                        use_comp=use_comp,
+                        requested_take_number=requested_take_number if explicit_override else None,
+                        explicit_track_requested=explicit_override,
+                    )
+            except ValueError as e:
+                self._send_error(ErrorCode.INVALID_MESSAGE, str(e), request_id=request_id)
+                return
+
+            try:
+                output_wav_path = self._resolve_render_output_path(
+                    output_path,
+                    midi_path,
+                    cached_request,
+                    track=resolved_track or track,
+                    take_id=take_id,
+                    use_comp=use_comp,
+                )
+            except OSError as e:
+                self._send_error(
+                    ErrorCode.OUTPUT_DIR_NOT_WRITABLE,
+                    f"Could not prepare output path: {e}",
+                    request_id=request_id,
+                )
+                return
+
+            try:
+                if output_wav_path.exists():
+                    if output_wav_path.is_dir():
+                        raise IsADirectoryError(f"Output path is a directory: {output_wav_path}")
+                    output_wav_path.unlink()
+            except OSError as e:
+                self._send_error(
+                    ErrorCode.FILE_WRITE_FAILED,
+                    f"Could not prepare output file: {e}",
+                    request_id=request_id,
+                )
+                return
+
+            try:
+                with tempfile.TemporaryDirectory(prefix="muse_take_render_") as temp_dir:
+                    temp_midi_path = Path(temp_dir) / f"{midi_path.stem}_take_render.mid"
+                    render_midi = self._build_take_render_midi(midi_file, selected_tracks)
+                    render_midi.save(str(temp_midi_path))
+
+                    renderer = self._create_audio_renderer(cached_request, cached_result)
+                    render_success = renderer.render_midi_file(
+                        str(temp_midi_path),
+                        str(output_wav_path),
+                        None,
+                    )
+            except ImportError as e:
+                self._send_error(
+                    ErrorCode.OPTIONAL_DEPENDENCY_MISSING,
+                    f"Audio rendering dependencies are missing: {e}",
+                    request_id=request_id,
+                )
+                return
+            except Exception as e:
+                self._send_error(
+                    ErrorCode.AUDIO_RENDER_FAILED,
+                    f"Render failed: {e}",
+                    request_id=request_id,
+                )
+                return
+
+            if not render_success or not output_wav_path.exists():
+                self._send_error(
+                    ErrorCode.AUDIO_RENDER_FAILED,
+                    f"Renderer failed to produce output WAV: {output_wav_path}",
+                    request_id=request_id,
+                )
+                return
+
+            self._send_message(OSCAddresses.TAKE_RENDERED, json.dumps({
+                "request_id": request_id,
+                "track": resolved_track or track,
+                "take_id": take_id if take_id else ("comp" if track and use_comp else ""),
+                "output_path": str(output_wav_path),
+                "success": True
+            }))
+            
+            self._log(f"   🎬 Rendered take arrangement to '{output_wav_path}'")
+            
+        except json.JSONDecodeError as e:
+            self._send_error(ErrorCode.INVALID_MESSAGE, f"Invalid JSON: {e}")
+        except Exception as e:
+            self._send_error(ErrorCode.UNKNOWN, str(e), request_id=request_id)
+    
+    # =========================================================================
+    # Worker Callbacks
+    # =========================================================================
+    
+    def _on_progress(self, step: str, percent: float, message: str):
+        """Called by worker to report progress."""
+        self._send_message(OSCAddresses.PROGRESS, json.dumps({
+            "request_id": self._current_request_id or "",
+            "step": step,
+            "percent": percent,
+            "message": message,
+        }))
+        
+        if self.config.verbose:
+            bar_width = 20
+            filled = int(bar_width * percent)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            self._log(f"   [{bar}] {percent*100:5.1f}% - {message}", end="\r")
+            if percent >= 1.0:
+                print()  # New line after completion
+
+    def _on_generation_complete(self, result: GenerationResult):
+        """Called by worker when generation completes."""
+        self._send_message(OSCAddresses.COMPLETE, json.dumps(result.to_dict()))
+
+        pending_request = self._pending_generation_request
+        if result.success and result.midi_path:
+            self._last_render_context = {
+                "result": dataclasses.replace(result),
+                "request": dataclasses.replace(pending_request) if pending_request else None,
+            }
+        self._pending_generation_request = None
+        
+        # Clear current request_id after completion
+        self._current_request_id = None
+        
+        self._log(f"✅ Generation complete: {result.task_id}")
+        if result.request_id:
+            self._log(f"   Request ID: {result.request_id}")
+            self._log(f"   Audio: {Path(result.audio_path).name}")
+        
+        if self.on_generation_complete:
+            self.on_generation_complete(result)
+    
+    def _on_instruments_loaded(self, result: Dict[str, Any]):
+        """Called when instrument scanning completes."""
+        self._send_message(OSCAddresses.INSTRUMENTS_LOADED, json.dumps(result))
+        
+        self._log(f"🎸 Instruments loaded: {result.get('count', 0)} total")
+        if self.config.verbose:
+            for source, count in result.get("sources", {}).items():
+                self._log(f"   {Path(source).name}: {count}")
+    
+    def _on_error(self, error_code: int, message: str):
+        """Called by worker on error."""
+        if error_code in (
+            ErrorCode.GENERATION_FAILED,
+            ErrorCode.GENERATION_TIMEOUT,
+            ErrorCode.GENERATION_CANCELLED,
+        ):
+            self._pending_generation_request = None
+
+        self._send_error(error_code, message)
+        
+        if self.on_error:
+            self.on_error(error_code, message)
+    
+    # =========================================================================
+    # OSC Message Sending
+    # =========================================================================
+    
+    def _send_message(self, address: str, *args):
+        """Send an OSC message to the client."""
+        if self._client:
+            try:
+                self._client.send_message(address, args)
+            except Exception as e:
+                self._log(f"⚠️  Failed to send message: {e}")
+    
+    def _send_error(self, code: int, message: str, request_id: str = ""):
+        """Send an error message to the client with request_id correlation."""
+        self._log(f"❌ Error [{code}]: {message}")
+        
+        # Use provided request_id or fall back to current request
+        req_id = request_id or self._current_request_id or ""
+        
+        self._send_message(OSCAddresses.ERROR, json.dumps({
+            "request_id": req_id,
+            "code": code,
+            "message": message,
+            "recoverable": code not in (
+                ErrorCode.SHUTDOWN_IN_PROGRESS,
+                ErrorCode.WORKER_CRASHED,
+            ),
+        }))
+    
+    def _send_status(self, status: str, data: Dict[str, Any]):
+        """Send a status update to the client."""
+        self._send_message(OSCAddresses.STATUS, json.dumps({
+            "status": status,
+            **data,
+        }))
+
+    # =========================================================================
+    # Intelligence Push Notifications (Sprint 4)
+    # =========================================================================
+
+    def notify_genre_dna(self, genre: str, vector: Dict[str, float]):
+        """Push genre DNA computation result to JUCE display."""
+        self._send_message(OSCAddresses.INTEL_GENRE_DNA, json.dumps({
+            "genre": genre,
+            "vector": vector,
+        }))
+        self._log(f"🧬 Genre DNA pushed: {genre}")
+
+    def notify_preference_update(self, dimension: str, old_value: float, new_value: float):
+        """Push preference dimension update to JUCE display."""
+        self._send_message(OSCAddresses.INTEL_PREFERENCE_UPDATE, json.dumps({
+            "dimension": dimension,
+            "old_value": round(old_value, 4),
+            "new_value": round(new_value, 4),
+        }))
+        self._log(f"📊 Preference pushed: {dimension} {old_value:.2f}->{new_value:.2f}")
+
+    def notify_search_result(self, query: str, results: list):
+        """Push embedding search results to JUCE display."""
+        summary = [{"name": r.get("name", ""), "score": round(r.get("similarity", 0), 3)}
+                   for r in results[:5]]
+        self._send_message(OSCAddresses.INTEL_SEARCH_RESULT, json.dumps({
+            "query": query,
+            "count": len(results),
+            "top": summary,
+        }))
+        self._log(f"🔍 Search pushed: '{query}' -> {len(results)} results")
+
+    def notify_session_compressed(self, level: str, token_budget: int):
+        """Push session compression event to JUCE display."""
+        self._send_message(OSCAddresses.INTEL_SESSION_COMPRESSED, json.dumps({
+            "level": level,
+            "token_budget": token_budget,
+        }))
+        self._log(f"📦 Compression pushed: L{level} (budget={token_budget})")
+
+    def notify_fusion_result(self, name: str, sources: list, distance_class: str):
+        """Push genre fusion result to JUCE display."""
+        self._send_message(OSCAddresses.INTEL_FUSION_RESULT, json.dumps({
+            "name": name,
+            "sources": sources,
+            "distance": distance_class,
+        }))
+        self._log(f"🎛️ Fusion pushed: {name} ({distance_class})")
+
+    def notify_exploration(self, suggestion: Dict[str, Any]):
+        """Push exploration suggestion to JUCE display."""
+        self._send_message(OSCAddresses.INTEL_EXPLORATION, json.dumps(suggestion))
+        self._log(f"🎲 Exploration pushed: {suggestion.get('dimension', '?')}")
+    
+    # =========================================================================
+    # Utilities
+    # =========================================================================
+    
+    def _log(self, message: str, end: str = "\n"):
+        """Log a message if verbose mode is enabled or it's important."""
+        # Always log important messages (errors, status changes)
+        important = any(c in message for c in ("✅", "❌", "⚠️", "🎵", "📥"))
+        
+        if self.config.verbose or important:
+            print(message, end=end, flush=True)
+
+        # Always append to a log file if configured (helps when embedded in a GUI app).
+        if self.config.log_file:
+            try:
+                from pathlib import Path
+
+                log_path = Path(self.config.log_file)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"{message}{end if end != '' else ''}")
+            except Exception:
+                pass
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals."""
+        # Only handle if we're actually running
+        if not self._running:
+            return
+        
+        signal_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        self._log(f"\n📛 Received signal: {signal_name}")
+        self.stop()
+        sys.exit(0)
+
+
+def run_server(
+    recv_port: int = 9000,
+    send_port: int = 9001,
+    host: str = "127.0.0.1",
+    verbose: bool = False,
+    **kwargs
+):
+    """
+    Convenience function to start the OSC server.
+    
+    Args:
+        recv_port: Port to receive messages (default 9000)
+        send_port: Port to send messages (default 9001)
+        host: Host address (default localhost)
+        verbose: Enable verbose logging
+        **kwargs: Additional config options
+    
+    Example:
+        ```python
+        from multimodal_gen.server import run_server
+        run_server(verbose=True)  # Blocking
+        ```
+    """
+    config = ServerConfig(
+        recv_port=recv_port,
+        send_port=send_port,
+        host=host,
+        verbose=verbose,
+        **kwargs
+    )
+    
+    server = MusicGenOSCServer(config)
+    server.start()

@@ -1,0 +1,280 @@
+#include "MixerComponent.h"
+#include "../Theme/ColourScheme.h"
+#include "../../Audio/AudioEngine.h"
+
+namespace UI
+{
+    MixerComponent::MixerComponent()
+    {
+        scopeNoticeLabel.setFont(juce::Font(11.0f));
+        scopeNoticeLabel.setColour(juce::Label::textColourId, AppColours::textSecondary.withAlpha(0.9f));
+        scopeNoticeLabel.setJustificationType(juce::Justification::centredLeft);
+        scopeNoticeLabel.setText("Scope: FX chain affects backend/offline render parity; live MIDI preview stays dry/unmastered.",
+                                 juce::dontSendNotification);
+        scopeNoticeLabel.setTooltip("Mixer and FX settings target backend/offline render parity. Live MIDI preview remains dry/unmastered with no live mastering path in this build.");
+        addAndMakeVisible(scopeNoticeLabel);
+
+        addAndMakeVisible(viewport);
+        viewport.setViewedComponent(&container, false);
+        viewport.setScrollBarsShown(true, true); // Allow both horizontal and vertical scrolling
+        
+        // Create master strip
+        masterStrip = std::make_unique<ChannelStrip>("Master");
+        addAndMakeVisible(*masterStrip);
+    }
+
+    MixerComponent::~MixerComponent()
+    {
+        stopTimer();
+        
+        if (projectState)
+            projectState->removeStateListener(this);
+    }
+
+    void MixerComponent::paint(juce::Graphics& g)
+    {
+        g.fillAll(AppColours::surface.darker(0.15f));
+        
+        // Draw separator line before master strip
+        if (masterStrip)
+        {
+            auto masterBounds = masterStrip->getBounds();
+            g.setColour(AppColours::border.brighter(0.2f));
+            g.drawVerticalLine(masterBounds.getX() - 2, 0.0f, (float)getHeight());
+        }
+    }
+
+    void MixerComponent::resized()
+    {
+        auto area = getLocalBounds();
+
+        auto noticeArea = area.removeFromTop(20).reduced(8, 0);
+        scopeNoticeLabel.setBounds(noticeArea);
+        area.removeFromTop(4);
+        
+        // Reserve space for master strip on the right (80px + 2px separator)
+        static constexpr int masterStripWidth = 82;
+        auto masterArea = area.removeFromRight(masterStripWidth);
+        masterArea.removeFromLeft(2); // separator gap
+        if (masterStrip)
+            masterStrip->setBounds(masterArea);
+        
+        // Channel strips viewport fills the rest
+        viewport.setBounds(area);
+        
+        // Update container size
+        if (strips.size() > 0)
+        {
+            int stripWidth = 80;
+            int totalWidth = strips.size() * stripWidth;
+            
+            // Ensure minimum height for strips to be usable
+            int minHeight = 280;
+            int containerHeight = juce::jmax(minHeight, viewport.getHeight() - 16); // -16 for scrollbar
+            
+            container.setBounds(0, 0, totalWidth, containerHeight);
+            
+            // Layout strips
+            for (int i = 0; i < strips.size(); ++i)
+            {
+                strips[i]->setBounds(i * stripWidth, 0, stripWidth, container.getHeight());
+            }
+        }
+    }
+
+    void MixerComponent::setTracks(const juce::StringArray& trackNames)
+    {
+        strips.clear();
+        
+        for (int i = 0; i < trackNames.size(); ++i)
+        {
+            auto* strip = new ChannelStrip(trackNames[i]);
+            container.addAndMakeVisible(strip);
+            strips.add(strip);
+            
+            // Selection logic
+            strip->onSelectionChange = [this, i]() {
+                selectTrack(i);
+            };
+            
+            if (projectState)
+            {
+                // Bind sliders to project state
+                // Volume
+                strip->getVolumeSlider().onValueChange = [this, i, strip]() {
+                    projectState->setTrackVolume(i, (float)strip->getVolumeSlider().getValue());
+                };
+                
+                // Pan
+                strip->getPanSlider().onValueChange = [this, i, strip]() {
+                    projectState->setTrackPan(i, (float)strip->getPanSlider().getValue());
+                };
+                
+                // Mute
+                strip->getMuteButton().onClick = [this, i, strip]() {
+                    projectState->setTrackMute(i, strip->getMuteButton().getToggleState());
+                };
+                
+                // Solo
+                strip->getSoloButton().onClick = [this, i, strip]() {
+                    projectState->setTrackSolo(i, strip->getSoloButton().getToggleState());
+                };
+                
+                // Initialize from state
+                updateStripFromState(i);
+            }
+        }
+        
+        // Restore selection or default to 0
+        if (selectedTrackIndex >= strips.size()) selectedTrackIndex = 0;
+        selectTrack(selectedTrackIndex);
+        
+        resized();
+    }
+
+    void MixerComponent::selectTrack(int index)
+    {
+        if (index < 0 || index >= strips.size()) return;
+        
+        selectedTrackIndex = index;
+        
+        for (int i = 0; i < strips.size(); ++i)
+        {
+            strips[i]->setSelected(i == selectedTrackIndex);
+        }
+        
+        if (onTrackSelected)
+            onTrackSelected(selectedTrackIndex);
+    }
+
+    void MixerComponent::bindToProject(Project::ProjectState& state)
+    {
+        if (projectState)
+            projectState->removeStateListener(this);
+            
+        projectState = &state;
+        projectState->addStateListener(this);
+        
+        // Re-bind existing strips
+        for (int i = 0; i < strips.size(); ++i)
+        {
+            auto* strip = strips[i];
+            
+            strip->getVolumeSlider().onValueChange = [this, i, strip]() {
+                projectState->setTrackVolume(i, (float)strip->getVolumeSlider().getValue());
+            };
+            
+            strip->getPanSlider().onValueChange = [this, i, strip]() {
+                projectState->setTrackPan(i, (float)strip->getPanSlider().getValue());
+            };
+            
+            strip->getMuteButton().onClick = [this, i, strip]() {
+                projectState->setTrackMute(i, strip->getMuteButton().getToggleState());
+            };
+            
+            strip->getSoloButton().onClick = [this, i, strip]() {
+                projectState->setTrackSolo(i, strip->getSoloButton().getToggleState());
+            };
+            
+            updateStripFromState(i);
+        }
+    }
+
+    void MixerComponent::updateStripFromState(int index)
+    {
+        if (!projectState || index < 0 || index >= strips.size()) return;
+        
+        auto trackNode = projectState->getTrackNode(index);
+        if (trackNode.isValid())
+        {
+            auto* strip = strips[index];
+            
+            // Update UI without triggering callbacks
+            juce::ScopedValueSetter<std::function<void()>> volGuard(strip->getVolumeSlider().onValueChange, nullptr);
+            strip->getVolumeSlider().setValue(trackNode.getProperty(Project::IDs::volume, 1.0f));
+            
+            juce::ScopedValueSetter<std::function<void()>> panGuard(strip->getPanSlider().onValueChange, nullptr);
+            strip->getPanSlider().setValue(trackNode.getProperty(Project::IDs::pan, 0.0f));
+            
+            juce::ScopedValueSetter<std::function<void()>> muteGuard(strip->getMuteButton().onClick, nullptr);
+            strip->getMuteButton().setToggleState(trackNode.getProperty(Project::IDs::mute, false), juce::dontSendNotification);
+            
+            juce::ScopedValueSetter<std::function<void()>> soloGuard(strip->getSoloButton().onClick, nullptr);
+            strip->getSoloButton().setToggleState(trackNode.getProperty(Project::IDs::solo, false), juce::dontSendNotification);
+            
+            strip->setName(trackNode.getProperty(Project::IDs::name));
+        }
+    }
+
+    // ProjectState::Listener overrides
+    void MixerComponent::valueTreePropertyChanged(juce::ValueTree& treeWhosePropertyHasChanged, const juce::Identifier& property)
+    {
+        if (treeWhosePropertyHasChanged.hasType(Project::IDs::TRACK))
+        {
+            int index = treeWhosePropertyHasChanged.getProperty(Project::IDs::index);
+            
+            // We need to update on the message thread
+            juce::MessageManager::callAsync([this, index]() {
+                updateStripFromState(index);
+            });
+        }
+    }
+
+    void MixerComponent::valueTreeChildAdded(juce::ValueTree& parentTree, juce::ValueTree& childWhichHasBeenAdded) {}
+    void MixerComponent::valueTreeChildRemoved(juce::ValueTree& parentTree, juce::ValueTree& childWhichHasBeenRemoved, int indexFromWhichChildWasRemoved) {}
+    void MixerComponent::valueTreeChildOrderChanged(juce::ValueTree& parentTreeWhichHasChanged, int oldIndex, int newIndex) {}
+    void MixerComponent::valueTreeParentChanged(juce::ValueTree& treeWhoseParentHasChanged) {}
+
+    void MixerComponent::setAudioEngine(mmg::AudioEngine* engine)
+    {
+        audioEngine = engine;
+        
+        if (audioEngine != nullptr)
+            startTimerHz(30); // 30 Hz meter polling — matches industry standard
+        else
+            stopTimer();
+    }
+
+    void MixerComponent::timerCallback()
+    {
+        if (audioEngine == nullptr)
+            return;
+        
+        // Check for solo state to zero non-soloed tracks
+        bool anySolo = false;
+        int numTracks = audioEngine->getNumTracks();
+        
+        for (int i = 0; i < numTracks; ++i)
+        {
+            if (auto* track = audioEngine->getTrack(i))
+            {
+                if (track->isSoloed())
+                {
+                    anySolo = true;
+                    break;
+                }
+            }
+        }
+        
+        // Update per-track meters
+        for (int i = 0; i < strips.size() && i < numTracks; ++i)
+        {
+            if (auto* track = audioEngine->getTrack(i))
+            {
+                float level = 0.0f;
+                
+                if (anySolo && !track->isSoloed())
+                    level = 0.0f; // Muted by solo — show 0
+                else
+                    level = track->getRmsLevel();
+                
+                strips[i]->updateLevel(level);
+            }
+        }
+        
+        // Update master strip
+        if (masterStrip)
+            masterStrip->updateLevel(audioEngine->getMasterRmsLevel());
+    }
+}
+
