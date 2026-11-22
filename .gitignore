@@ -121,6 +121,11 @@ verify_chord_extraction.py
 *.sfz
 *.SFZ
 
+# Local neural model weights & llama.cpp runtime binaries
+models/
+*.gguf
+tools/llama-cpp/
+
 # Audio files (test outputs)
 *.wav
 *.mp3

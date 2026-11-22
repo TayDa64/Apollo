@@ -681,13 +681,31 @@ def _coerce_generation_request(
 
 def _build_score_plan_system_prompt() -> str:
     return (
-        "You are MUSE's symbolic music planner. Return ONLY a single valid JSON object "
+        "You are Apollo's symbolic music planner. Return ONLY a single valid JSON object "
         "conforming strictly to schema_version='score_plan_v1' with required keys: "
         "schema_version, prompt, bpm (30..220), key (A-G with optional #/b), mode "
         "(major|minor|dorian|phrygian|lydian|mixolydian|locrian), sections (non-empty list of "
         "{name, type, bars[, energy, tension]}), and tracks (non-empty list of {role, instrument}). "
-        "Do not emit unknown keys or explanatory prose."
+        "Respect genre-authentic instrumentation and constraints. Do not emit unknown keys or prose."
     )
+
+
+def _build_user_message_content(req: NeuralGenerationRequest) -> str:
+    """Use plain prompt text for standard score_plan requests to match Apollo SFT/GRPO training."""
+    has_extra_context = bool(
+        req.session_context
+        or req.constraints
+        or req.audio_conditioning
+        or req.genre_hint
+        or req.bpm_hint is not None
+        or req.key_hint
+        or req.mode_hint
+        or req.duration_bars is not None
+        or tuple(req.requested_outputs) != ("score_plan",)
+    )
+    if not has_extra_context:
+        return req.prompt
+    return req.model_dump_json(exclude_none=True)
 
 
 def _parse_model_payload_to_response(
@@ -1079,7 +1097,7 @@ class RemoteOpenAICompatibleNeuralAdapter:
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": _build_score_plan_system_prompt()},
-                {"role": "user", "content": req.model_dump_json(exclude_none=True)},
+                {"role": "user", "content": _build_user_message_content(req)},
             ],
         }
         effective_seed = req.seed if req.seed is not None else self.config.seed
